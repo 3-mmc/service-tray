@@ -4,6 +4,15 @@ A Windows system-tray monitor for services on Windows **and** in WSL: what is li
 on which port, whether it answers, and whether its Docker container is healthy. Written
 in [Xojo](https://xojo.com); a sibling of [LlamaTray](https://github.com/3-mmc/llama-tray).
 
+<p>
+  <img src="docs/menu.png" alt="The tray menu: Windows and WSL services by category, each with a status dot and its port" height="560">
+  <img src="docs/details.png" alt="The details window: status, port, side and owning process for every service" width="560">
+</p>
+
+The real thing, on the machine it was written for: 22 services across Windows and a WSL
+Debian (media stack, local AI gateway, self-hosted apps in Docker, MCP backends), with
+the menu on the left and *Details...* on the right.
+
 - **Icon colour:** green when every service is up, orange when one is degraded (port open
   but the health check fails, or Docker says unhealthy), red when one is down, grey
   before the first probe or when the config is missing. Inside the disc, LlamaTray's
