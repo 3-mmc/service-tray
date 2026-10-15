@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Send an IDE Script to the running Xojo IDE (Windows) over its IDE Communicator v2 port.
+
+On Windows the IDE's IPCSocket is a TCP listener on 127.0.0.1 (port derived from the
+"XojoIDE" path), and WSL's mirrored networking reaches it directly. The port is
+discovered from netstat each run because it is not guaranteed stable across restarts.
+
+  xojo-ide 'Print "hi"'              run an inline script, print the response
+  xojo-ide -f build.xojo_script      run a script file
+  xojo-ide build D:\\path\\App.xojo_project [target]   reload from disk + BuildApp (19 = Win x64)
+
+The IDE builds from its in-memory copy and does not notice edits made on disk, and
+CloseProject/RevertToSaved don't reload it. So `build` quits the IDE without saving
+(QuitIDE(False)), reopens the project through explorer.exe (a launch from a WSL child
+process dies with its parent), waits for the communicator, then builds.
+Never leave unsaved work in the IDE while an agent is building.
+"""
+import json, os, socket, subprocess, sys, time
+
+def xojo_ports():
+    pids = subprocess.run(["tasklist.exe", "/fi", "imagename eq Xojo.exe", "/fo", "csv", "/nh"],
+                          capture_output=True, text=True, encoding="cp850", errors="replace", cwd="/mnt/c").stdout
+    pids = {l.split('","')[1] for l in pids.splitlines() if l.startswith('"Xojo.exe"')}
+    if not pids:
+        sys.exit("xojo-ide: Xojo IDE is not running (the communicator only exists while it is open)")
+    net = subprocess.run(["netstat.exe", "-ano", "-p", "tcp"], capture_output=True, encoding="cp850", errors="replace",
+                         text=True, cwd="/mnt/c").stdout
+    ports = []
+    for line in net.splitlines():
+        f = line.split()
+        if len(f) == 5 and f[4] in pids and f[1].startswith("127.0.0.1:") and f[2].endswith(":0"):
+            ports.append(int(f[1].rsplit(":", 1)[1]))
+    return ports
+
+def send(script, tag="cli", timeout=600):
+    last = None
+    for port in xojo_ports():
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            s.sendall(b'{"protocol":2}\0' + json.dumps({"script": script, "tag": tag}).encode() + b"\0")
+            s.settimeout(timeout)
+            data = b""
+            while b"\0" not in data:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            s.close()
+            if data:
+                return json.loads(data.split(b"\0", 1)[0])
+        except OSError as e:
+            last = e
+    sys.exit(f"xojo-ide: no communicator answered ({last})")
+
+def xojo_running():
+    out = subprocess.run(["tasklist.exe", "/fi", "imagename eq Xojo.exe", "/fo", "csv", "/nh"],
+                         capture_output=True, encoding="cp850", errors="replace", cwd="/mnt/c").stdout
+    return '"Xojo.exe"' in out
+
+def reopen(project):
+    if xojo_running():
+        try:
+            send("QuitIDE(False)", timeout=15)
+        except SystemExit:
+            pass  # the IDE exits before it can answer
+        for _ in range(30):
+            if not xojo_running():
+                break
+            time.sleep(0.5)
+    win = os.path.dirname(project.replace("\\", "/"))
+    subprocess.Popen(["explorer.exe", os.path.basename(project.replace("\\", "/"))],
+                     cwd=subprocess.run(["wslpath", "-u", win], capture_output=True, text=True).stdout.strip())
+    for _ in range(60):
+        time.sleep(1)
+        if xojo_running() and xojo_ports():
+            try:
+                if send('Print "up"', timeout=5).get("response") == "up":
+                    time.sleep(3)  # let the project finish loading
+                    return
+            except SystemExit:
+                pass
+    sys.exit("xojo-ide: IDE did not come back up")
+
+def main(a):
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__); return 0
+    if a[0] == "-f":
+        script = open(a[1], encoding="utf-8").read()
+    elif a[0] == "build":
+        target = a[2] if len(a) > 2 else "19"
+        # BuildApp returns the built path, or a buildError object on failure.
+        reopen(a[1])
+        script = f'Print BuildApp({target}, False)'
+    else:
+        script = " ".join(a)
+    r = send(script)
+    resp = r.get("response")
+    print(resp if isinstance(resp, str) else json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0 if isinstance(resp, str) and resp not in ("", "openfailed") else 1
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
