@@ -385,6 +385,111 @@ Inherits DesktopApplication
 	#tag EndMethod
 
 	#tag Method, Flags = &h21
+		Private Sub StartEvents()
+		  ' One long-lived GET; llama-swap sends the full model list at once, then again on
+		  ' every change (loading, ready, stopping). Timeout 0 = wait indefinitely.
+		  mSseBuf = ""
+		  mEventsAlive = False
+		  mEventsStarted = mSeconds
+		  mEventsConn = New URLConnection
+		  AddHandler mEventsConn.ReceivingProgressed, WeakAddressOf EventsData
+		  AddHandler mEventsConn.ContentReceived, WeakAddressOf EventsEnded
+		  AddHandler mEventsConn.Error, WeakAddressOf EventsError
+		  mEventsConn.Send("GET", mLlamaUrl + "/api/events", 0)
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub EventsData(sender As URLConnection, bytesReceived As Int64, totalBytes As Int64, newData As String)
+		  #Pragma Unused sender
+		  #Pragma Unused bytesReceived
+		  #Pragma Unused totalBytes
+		  ' Server-sent events: blocks separated by a blank line, payload on "data:" lines.
+		  ' Bytes are buffered raw so a UTF-8 character split across chunks survives.
+		  mSseBuf = mSseBuf + newData
+		  Var sep As String = Chr(10) + Chr(10)
+		  Var cut As Integer = mSseBuf.IndexOfBytes(sep)
+		  While cut >= 0
+		    Var block As String = mSseBuf.LeftBytes(cut).DefineEncoding(Encodings.UTF8)
+		    mSseBuf = mSseBuf.MiddleBytes(cut + 2)
+		    For Each line As String In block.ToArray(Chr(10))
+		      If line.BeginsWith("data:") Then HandleEvent(line.Middle(5).Trim)
+		    Next
+		    cut = mSseBuf.IndexOfBytes(sep)
+		  Wend
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub EventsEnded(sender As URLConnection, URL As String, HTTPStatus As Integer, content As String)
+		  #Pragma Unused sender
+		  #Pragma Unused URL
+		  #Pragma Unused HTTPStatus
+		  #Pragma Unused content
+		  ' The gateway closed the stream (restart, shutdown): reconnect shortly.
+		  mEventsConn = Nil
+		  mEventsRetryAt = mSeconds + 5
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub EventsError(sender As URLConnection, e As RuntimeException)
+		  #Pragma Unused sender
+		  #Pragma Unused e
+		  mEventsConn = Nil
+		  mEventsRetryAt = mSeconds + 5
+		  mLlamaUp = False
+		  mRunning = New Dictionary
+		  mDirty = True
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub HandleEvent(json As String)
+		  ' {"type":"modelStatus","data":"[{\"id\":…,\"state\":\"ready\",\"unlisted\":false}, …]"}
+		  ' The data field is itself JSON, as a string. Other event types are ignored.
+		  Try
+		    Var ev As Dictionary = ParseJSON(json)
+		    If GetStr(ev, "type") <> "modelStatus" Then Return
+		    Var arr() As Variant = ParseJSON(GetStr(ev, "data"))
+		    Var ids() As String
+		    Var names As New Dictionary
+		    Var running As New Dictionary
+		    For Each v As Variant In arr
+		      Var m As Dictionary = v
+		      Var id As String = GetStr(m, "id")
+		      Var stt As String = GetStr(m, "state")
+		      If stt <> "stopped" And stt <> "shutdown" And stt <> "" Then running.Value(id) = stt
+		      If m.HasKey("unlisted") And m.Value("unlisted").BooleanValue Then Continue
+		      ids.Add(id)
+		      names.Value(id) = If(GetStr(m, "name") <> "", GetStr(m, "name"), id)
+		    Next
+		    mModels = ids
+		    mModelNames = names
+		    ' A model that starts or stops changes VRAM: read it on the next tick.
+		    If running.KeyCount <> mRunning.KeyCount Then mGpuDue = 0
+		    mRunning = running
+		    mLlamaUp = True
+		    mEventsAlive = True
+		    mDirty = True
+		  Catch e As RuntimeException
+		  End Try
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub GpuCompleted(sender As Shell)
+		  ' nvidia-smi --format=csv,noheader,nounits -> "1832, 8192" (MiB)
+		  Var parts() As String = sender.Result.Trim.ToArray(",")
+		  If parts.Count >= 2 And parts(1).Trim.ToInteger > 0 Then
+		    mVramUsed = parts(0).Trim.ToInteger
+		    mVramTotal = parts(1).Trim.ToInteger
+		    mDirty = True
+		  End If
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
 		Private Sub HealthCheck(s As Dictionary)
 		  Var c As New URLConnection
 		  AddHandler c.ContentReceived, WeakAddressOf HealthReceived
@@ -404,7 +509,7 @@ Inherits DesktopApplication
 		  mHealth.Value(mHealthConns.Value(sender).StringValue) = 0
 		  mHealthMsg.Value(mHealthConns.Value(sender).StringValue) = e.Message
 		  mHealthConns.Remove(sender)
-		  Refresh
+		  mDirty = True
 		End Sub
 	#tag EndMethod
 
@@ -415,7 +520,7 @@ Inherits DesktopApplication
 		  If Not mHealthConns.HasKey(sender) Then Return
 		  mHealth.Value(mHealthConns.Value(sender).StringValue) = HTTPStatus
 		  mHealthConns.Remove(sender)
-		  Refresh
+		  mDirty = True
 		End Sub
 	#tag EndMethod
 
@@ -445,7 +550,7 @@ Inherits DesktopApplication
 		  If HTTPStatus >= 400 And what <> "load" Then
 		    MessageBox("llama-swap answered HTTP " + HTTPStatus.ToString + " to " + what + ".")
 		  End If
-		  PollLlama(False)
+		  If mLlamaPolling Then PollLlama(False)
 		End Sub
 	#tag EndMethod
 
@@ -453,7 +558,7 @@ Inherits DesktopApplication
 		Private Sub LlamaActionError(sender As URLConnection, e As RuntimeException)
 		  Var what As String = LlamaForget(sender)
 		  MessageBox("Request to llama-swap (" + what + ") failed: " + e.Message)
-		  PollLlama(False)
+		  If mLlamaPolling Then PollLlama(False)
 		End Sub
 	#tag EndMethod
 
@@ -477,7 +582,7 @@ Inherits DesktopApplication
 		  #Pragma Unused e
 		  mLlamaUp = False
 		  mRunning = New Dictionary
-		  Refresh
+		  mDirty = True
 		End Sub
 	#tag EndMethod
 
@@ -807,13 +912,12 @@ Inherits DesktopApplication
 
 	#tag Method, Flags = &h21
 		Private Function MenuLine(name As String, st As Integer, port As Integer, detail As String) As String
-		  ' Name (and detail) on the left; after the tab, Windows right-aligns the mark and
-		  ' port into one column, so the whole menu lines up.
-		  Var left As String = name
+		  ' Mark, name and detail on the left; after the tab Windows right-aligns the port,
+		  ' so ports line up without leaving a wide gap before the status.
+		  Var left As String = "   " + Mark(st) + "   " + name.Trim
 		  If detail <> "" Then left = left + "  -  " + detail
-		  Var right As String = Mark(st)
-		  If port > 0 Then right = right + "   :" + port.ToString
-		  Return left + Chr(9) + right
+		  If port > 0 Then Return left + Chr(9) + ":" + port.ToString
+		  Return left
 		End Function
 	#tag EndMethod
 
@@ -933,6 +1037,7 @@ Inherits DesktopApplication
 
 	#tag Method, Flags = &h21
 		Private Sub Refresh()
+		  mDirty = False
 		  Var up, down, degraded As Integer
 		  Var bad() As String
 		  Var lines() As String
@@ -1016,6 +1121,8 @@ Inherits DesktopApplication
 		Sub RefreshNow()
 		  mHealthDue = New Dictionary
 		  mSeconds = -1
+		  mGpuDue = 0
+		  If mLlamaPolling Then PollLlama(True)
 		  Tick(mTimer)
 		End Sub
 	#tag EndMethod
@@ -1065,7 +1172,7 @@ Inherits DesktopApplication
 		    End Try
 		  End If
 		  mRunning = r
-		  Refresh
+		  mDirty = True
 		End Sub
 	#tag EndMethod
 
@@ -1138,13 +1245,13 @@ Inherits DesktopApplication
 		      Var ok, total As Integer
 		      Var worst As Integer = Rollup(members, ok, total)
 		      m.AddMenu(New DesktopMenuItem(DesktopMenuItem.TextSeparator))
-		      section = New DesktopMenuItem(li.Value("text").StringValue.Uppercase + Chr(9) + Mark(worst) + "   " + ok.ToString + "/" + total.ToString)
+		      section = New DesktopMenuItem(Mark(worst) + "   " + li.Value("text").StringValue.Uppercase + Chr(9) + ok.ToString + "/" + total.ToString)
 		      ' Optional: a fully healthy section folds into its header line.
 		      folded = mCollapseHealthy And ok = total
 		      section.Enabled = folded
 		      m.AddMenu(section)
 		    Case "sub"
-		      Var label As New DesktopMenuItem("   ·  " + li.Value("text").StringValue)
+		      Var label As New DesktopMenuItem("         " + li.Value("text").StringValue)
 		      label.Enabled = False
 		      If folded Then section.AddMenu(label) Else m.AddMenu(label)
 		    Case "svc"
@@ -1158,7 +1265,7 @@ Inherits DesktopApplication
 		      If folded Then section.AddMenu(item) Else m.AddMenu(item)
 		      If sv = LlamaService Then
 		        For Each k As Variant In mRunning.Keys
-		          Var model As New DesktopMenuItem("            " + ModelLabel(k.StringValue) + Chr(9) + mRunning.Value(k).StringValue)
+		          Var model As New DesktopMenuItem("                  " + ModelLabel(k.StringValue) + Chr(9) + mRunning.Value(k).StringValue)
 		          model.Enabled = False
 		          If folded Then section.AddMenu(model) Else m.AddMenu(model)
 		        Next
@@ -1169,7 +1276,7 @@ Inherits DesktopApplication
 		  ' Listeners nobody configured. New ones (a dev server, a demo) get their own section.
 		  Var eph() As String = PortKeys(True)
 		  m.AddMenu(New DesktopMenuItem(DesktopMenuItem.TextSeparator))
-		  Var eh As New DesktopMenuItem("EPHEMERAL" + Chr(9) + If(eph.Count = 0, "none", eph.Count.ToString))
+		  Var eh As New DesktopMenuItem(Mark(kStEphemeral) + "   EPHEMERAL" + Chr(9) + If(eph.Count = 0, "none", eph.Count.ToString))
 		  eh.Enabled = False
 		  m.AddMenu(eh)
 		  For Each k As String In eph
@@ -1178,7 +1285,7 @@ Inherits DesktopApplication
 		    m.AddMenu(item)
 		  Next
 		  Var other() As String = PortKeys(False)
-		  Var oh As New DesktopMenuItem("      Other listeners" + Chr(9) + other.Count.ToString)
+		  Var oh As New DesktopMenuItem("   " + Mark(kStIdle) + "   Other listeners" + Chr(9) + other.Count.ToString)
 		  For Each k As String In other
 		    Var item As New DesktopMenuItem(PortOwner(k) + Chr(9) + ":" + Field(k, ":", 1))
 		    FillActions("port:" + k, item)
@@ -1296,38 +1403,61 @@ Inherits DesktopApplication
 		  #Pragma Unused sender
 		  mSeconds = mSeconds + 1
 
+		  Var winScanned As Boolean
 		  If mSeconds Mod mWinEvery = 0 Then
 		    mWinPorts = WinPorts.Listeners
 		    mWinKnown = True
 		    UpdateSeen("win", mWinPorts)
+		    winScanned = True
+		    mDirty = True
 		  End If
 		  ' While the details window is open, WSL is looked at more often.
 		  Var wslEvery As Integer = If(mDetails <> Nil, Min(mWslEvery, 5), mWslEvery)
 		  If mSeconds Mod wslEvery = 0 Then ProbeWsl
 
-		  ' llama-swap keeps LlamaTray's cadence: /running every 3 s, the model list every 30 s.
-		  ' VRAM is an in-process NVML call, so it costs nothing to keep in step.
-		  If mSeconds Mod 3 = 0 Then
-		    PollLlama(mSeconds Mod 30 = 0)
-		    Call Gpu.ReadVram(mVramUsed, mVramTotal)
+		  ' llama-swap pushes model changes over /api/events, so normally nothing is polled.
+		  ' If the stream never delivers (or keeps failing), fall back to LlamaTray's polling.
+		  If mLlamaUrl <> "" Then
+		    If mLlamaPolling Then
+		      If mSeconds Mod 3 = 0 Then PollLlama(mSeconds Mod 30 = 0)
+		    ElseIf mEventsConn = Nil Then
+		      If mSeconds >= mEventsRetryAt Then StartEvents
+		    ElseIf Not mEventsAlive And mSeconds - mEventsStarted > 10 Then
+		      mEventsConn.Disconnect
+		      mEventsConn = Nil
+		      mLlamaPolling = True
+		    End If
 		  End If
 
-		  ' Health checks run on each service's own interval ("every", else healthEvery),
-		  ' and only while its port is listening; a closed port already says it is down.
+		  ' VRAM: nvidia-smi every 5 s while a model is loaded, every 30 s otherwise. A short
+		  ' process now and then beats keeping nvml.dll and its driver parts resident.
+		  If mSeconds >= mGpuDue Then
+		    mGpuDue = mSeconds + If(mRunning.KeyCount > 0, 5, 30)
+		    If mGpuShell = Nil Then
+		      mGpuShell = New Shell
+		      mGpuShell.ExecuteMode = Shell.ExecuteModes.Asynchronous
+		      AddHandler mGpuShell.Completed, WeakAddressOf GpuCompleted
+		    End If
+		    If Not mGpuShell.IsRunning Then mGpuShell.Execute("nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits")
+		  End If
+
 		  For Each s As Dictionary In mServices
 		    Var name As String = GetStr(s, "name")
-		    Var detail As String
-		    Var st As Integer = Status(s, detail)
-		    ' A required Windows service whose port went quiet: find out at once whether the
-		    ' port itself got eaten (at most every 5 min per port; the bind lasts microseconds).
-		    If st = kStDown And GetStr(s, "side") = "win" And GetInt(s, "port", 0) > 1023 Then
-		      If mSeconds >= mAutoChecked.Lookup(name, -1).IntegerValue Then
+		    ' A required Windows service whose port went quiet: find out whether the port
+		    ' itself got eaten (at most every 5 min per port; the bind lasts microseconds).
+		    If winScanned And GetStr(s, "side") = "win" And GetInt(s, "port", 0) > 1023 Then
+		      Var d As String
+		      If Status(s, d) = kStDown And mSeconds >= mAutoChecked.Lookup(name, -1).IntegerValue Then
 		        mAutoChecked.Value(name) = mSeconds + 300
 		        Timer.CallLater(0, AddressOf AutoCheckPorts)
 		      End If
 		    End If
+		    ' Health checks run on each service's own interval ("every", else healthEvery),
+		    ' and only while its port is listening; a closed port already says it is down.
 		    If GetStr(s, "health") = "" Then Continue
 		    If mSeconds < mHealthDue.Lookup(name, 0).IntegerValue Then Continue
+		    Var detail As String
+		    Var st As Integer = Status(s, detail)
 		    If st = kStUnknown Then Continue
 		    mHealthDue.Value(name) = mSeconds + GetInt(s, "every", mHealthEvery)
 		    If st = kStDown Or st = kStIdle Then
@@ -1337,7 +1467,8 @@ Inherits DesktopApplication
 		    End If
 		  Next
 
-		  Refresh
+		  ' Everything above only marks the view dirty; it is rebuilt at most once a second.
+		  If mDirty Then Refresh
 		End Sub
 	#tag EndMethod
 
@@ -1410,7 +1541,7 @@ Inherits DesktopApplication
 		      UpdateSeen("wsl", mWslPorts)
 		      ' A distro that boots later brings its own baseline, not a burst of "new" ports.
 		      mWslBaselined = False
-		      Refresh
+		      mDirty = True
 		      Return
 		    End If
 		    ' Started from a fresh event, not from inside this Shell's own Completed.
@@ -1463,7 +1594,7 @@ Inherits DesktopApplication
 		  mDockerPorts = dports
 		  mWslKnown = True
 		  UpdateSeen("wsl", mWslPorts)
-		  Refresh
+		  mDirty = True
 		End Sub
 	#tag EndMethod
 
@@ -1507,6 +1638,42 @@ Inherits DesktopApplication
 
 	#tag Property, Flags = &h21
 		Private mPrefs As PrefsWindow
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mDirty As Boolean
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mEventsAlive As Boolean
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mEventsConn As URLConnection
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mEventsRetryAt As Integer
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mEventsStarted As Integer
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mGpuDue As Integer
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mGpuShell As Shell
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mLlamaPolling As Boolean
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mSseBuf As String
 	#tag EndProperty
 
 	#tag Property, Flags = &h21

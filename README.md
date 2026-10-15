@@ -9,8 +9,8 @@ in [Xojo](https://xojo.com); a sibling of [LlamaTray](https://github.com/3-mmc/l
   before the first probe or when the config is missing. Inside the disc, LlamaTray's
   white bar shows VRAM use.
 - **Tooltip:** counts plus the names of anything not up, running models, VRAM.
-- **Click:** every service at a glance. The name is on the left; the status mark and
-  `:port` sit in a right-aligned column. Each service has a submenu (Open, Restart…,
+- **Click:** every service at a glance: status mark and name on the left, `:port` in a
+  right-aligned column. Each service has a submenu (Open, Restart…,
   Copy port); the llama-swap entry also has LlamaTray's Unload / Unload all / Load menu,
   with the running models listed beneath it.
 - **Ephemeral:** listeners nobody configured that appeared *after* ServiceTray started,
@@ -35,16 +35,19 @@ in [Xojo](https://xojo.com); a sibling of [LlamaTray](https://github.com/3-mmc/l
 | Windows listeners | `GetExtendedTcpTable` + a Toolhelp snapshot, in-process (no netstat) | 5 s |
 | WSL listeners + Docker | one `wsl.exe -e sh -c "ss -ltnH; docker ps -a …"` call | 15 s |
 | Health | HTTP GET per service, only while its port is listening | per service (`every`), default 30 s |
-| llama-swap | `/running`, `/v1/models` (as in LlamaTray) | 3 s / 30 s |
-| VRAM | `nvml.dll` in-process (no `nvidia-smi`) | 3 s |
+| llama-swap | one long-lived `GET /api/events` stream; model changes are pushed (falls back to LlamaTray's `/running` polling if the stream never delivers) | push |
+| VRAM | `nvidia-smi` | 5 s while a model is loaded, else 30 s |
 
 Under WSL's **mirrored networking**, WSL's listening ports do not show up in Windows'
 TCP table at all, which is why the WSL side is probed separately. Before probing, the app
 checks `wsl.exe -l --running`, so it never boots a stopped distro.
 
-Measured cost (2026-10-15): about 0.8 CPU-seconds per minute and 82 MB private memory,
-of which roughly 45 MB is `nvml.dll` and the driver bits it loads. Without the llama-swap
-and VRAM polling it was 0.2 s/min and 37 MB.
+Everything marks the view dirty; it is rebuilt at most once a second, and only when
+something changed. Process names for the Windows table are cached between scans.
+
+Measured cost (2026-10-15): about 0.4 CPU-seconds per minute and 11 MB private memory.
+An earlier build read VRAM through `nvml.dll`, which kept about 45 MB of driver
+components resident (82 MB in total) and polled llama-swap every 3 s (0.8 s/min).
 
 ## Port check
 

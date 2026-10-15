@@ -9,7 +9,14 @@ Protected Module WinPorts
 		  #If TargetWindows
 		    Declare Function GetExtendedTcpTable Lib "iphlpapi.dll" (table As Ptr, ByRef size As UInt32, order As Int32, af As UInt32, tableClass As Int32, reserved As UInt32) As UInt32
 		    Const kListener = 3 ' TCP_TABLE_OWNER_PID_LISTENER
-		    Var names As Dictionary = ProcessNames
+		    ' Process names are cached between scans; a fresh Toolhelp snapshot is taken only
+		    ' for an unknown pid, or once a minute so a reused pid cannot keep a stale name.
+		    If mNames = Nil Or mNamesAt = Nil Or DateTime.Now.SecondsFrom1970 - mNamesAt.SecondsFrom1970 > 60 Then
+		      mNames = ProcessNames
+		      mNamesAt = DateTime.Now
+		    End If
+		    Var names As Dictionary = mNames
+		    mRetook = False
 		    Var families() As Integer = Array(2, 23) ' AF_INET, AF_INET6
 		    For Each af As Integer In families
 		      ' MIB_TCPROW_OWNER_PID is 24 bytes (port at 8, pid at 20);
@@ -41,6 +48,12 @@ Protected Module WinPorts
 		        Var pid As Integer = mb.UInt32Value(off + pidOff)
 		        ' One port can have several owners on different addresses (sshd on loopback,
 		        ' tailscaled on the tailnet IP for :22), so list every distinct one.
+		        If Not names.HasKey(pid) And Not mRetook Then
+		          mNames = ProcessNames
+		          mNamesAt = DateTime.Now
+		          names = mNames
+		          mRetook = True
+		        End If
 		        Var name As String = names.Lookup(pid, "pid " + pid.ToString)
 		        Var have As String = ", " + result.Lookup(port, "").StringValue + ", "
 		        If Not result.HasKey(port) Then
@@ -85,6 +98,19 @@ Protected Module WinPorts
 		  Return names
 		End Function
 	#tag EndMethod
+
+
+	#tag Property, Flags = &h21
+		Private mNames As Dictionary
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mNamesAt As DateTime
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mRetook As Boolean
+	#tag EndProperty
 
 
 End Module

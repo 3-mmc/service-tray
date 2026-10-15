@@ -5,7 +5,6 @@ OrigIDEVersion=20260201
 Class=App;App.xojo_code;&h000000005B7517FF;&h0000000000000000;false
 Class=TrayIcon;TrayIcon.xojo_code;&h000000001A2B3C4D;&h0000000000000000;false
 Module=WinPorts;WinPorts.xojo_code;&h000000002E4F6A1B;&h0000000000000000;false
-Module=Gpu;Gpu.xojo_code;&h000000004A1C2E3F;&h0000000000000000;false
 Module=PortProbe;PortProbe.xojo_code;&h000000005D2E7C11;&h0000000000000000;false
 DesktopWindow=DetailsWindow;DetailsWindow.xojo_window;&h00000000619AB3C7;&h0000000000000000;false
 DesktopWindow=PrefsWindow;PrefsWindow.xojo_window;&h0000000072C4D9E1;&h0000000000000000;false
