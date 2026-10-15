@@ -39,7 +39,15 @@ Protected Module WinPorts
 		        ' The port is in network byte order in the low 16 bits.
 		        Var port As Integer = mb.Byte(off + portOff) * 256 + mb.Byte(off + portOff + 1)
 		        Var pid As Integer = mb.UInt32Value(off + pidOff)
-		        If Not result.HasKey(port) Then result.Value(port) = names.Lookup(pid, "pid " + pid.ToString)
+		        ' One port can have several owners on different addresses (sshd on loopback,
+		        ' tailscaled on the tailnet IP for :22), so list every distinct one.
+		        Var name As String = names.Lookup(pid, "pid " + pid.ToString)
+		        Var have As String = ", " + result.Lookup(port, "").StringValue + ", "
+		        If Not result.HasKey(port) Then
+		          result.Value(port) = name
+		        ElseIf have.IndexOf(", " + name + ", ") < 0 Then
+		          result.Value(port) = result.Value(port).StringValue + ", " + name
+		        End If
 		      Next
 		    Next
 		  #EndIf
