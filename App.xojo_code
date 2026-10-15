@@ -1382,7 +1382,10 @@ Inherits DesktopApplication
 		  detail = ""
 		  Var side As String = GetStr(s, "side")
 		  Var port As Integer = GetInt(s, "port", 0)
-		  Var isOptional As Boolean = s.HasKey("optional") And s.Value("optional").BooleanValue
+		  ' "reserved": a port kept free for a program that only listens now and then (an
+		  ' OAuth callback, say). Free is fine; it only matters who holds it.
+		  Var isReserved As Boolean = s.HasKey("reserved") And s.Value("reserved").BooleanValue
+		  Var isOptional As Boolean = isReserved Or (s.HasKey("optional") And s.Value("optional").BooleanValue)
 		  Var listening As Boolean
 
 		  If side = "wsl" Then
@@ -1420,16 +1423,27 @@ Inherits DesktopApplication
 		  If Not listening Then
 		    ' Its own process listening on a port nobody configured: the service moved and
 		    ' services.json did not follow. Running, so degraded rather than down.
-		    Var moved As Integer = MovedTo(s)
+		    Var moved As Integer = If(isReserved, 0, MovedTo(s))
 		    If moved > 0 Then
 		      detail = PortOwner(side + ":" + moved.ToString) + " is listening on :" + moved.ToString + " instead"
 		      Return kStDegraded
 		    End If
-		    detail = If(isOptional, "not running", "not listening")
+		    detail = If(isReserved, "free (reserved)", If(isOptional, "not running", "not listening"))
 		    ' A port check that found the port unbindable explains why nothing can listen.
 		    If mPortVerdict.HasKey(port) Then detail = detail + ": port " + mPortVerdict.Value(port).StringValue
 		    Return If(isOptional, kStIdle, kStDown)
 		  End If
+
+		  ' With "process" set, the port belongs to that program; anyone else holding it is a
+		  ' conflict (the program will fail to bind when it needs the port).
+		  If GetStr(s, "process") <> "" And GetStr(s, "docker") = "" Then
+		    Var who As String = Owner(s)
+		    If who <> "" And Not OwnerMatches(who, GetStr(s, "process")) Then
+		      detail = "taken by " + who
+		      Return kStDegraded
+		    End If
+		  End If
+		  If isReserved Then detail = "in use"
 
 		  If s = LlamaService And mRunning.KeyCount > 0 Then
 		    For Each k As Variant In mRunning.Keys
@@ -1628,6 +1642,16 @@ Inherits DesktopApplication
 		    If hit Then best = p
 		  Next
 		  Return best
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function OwnerMatches(who As String, process As String) As Boolean
+		  ' The Windows table can list several owners for one port ("tailscaled.exe, sshd.exe").
+		  For Each part As String In who.ToArray(",")
+		    If OwnerKey(part.Trim.Replace(" (WSL)", "")) = OwnerKey(process) Then Return True
+		  Next
+		  Return False
 		End Function
 	#tag EndMethod
 

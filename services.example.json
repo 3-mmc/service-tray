@@ -18,6 +18,8 @@
     {"name": "Radarr", "group": "Media", "side": "win", "port": 7878, "health": "http://127.0.0.1:7878/ping", "every": 120, "open": "http://127.0.0.1:7878/"},
     {"name": "Sonarr", "group": "Media", "side": "win", "port": 8990, "health": "http://127.0.0.1:8990/ping", "every": 120, "open": "http://127.0.0.1:8990/"},
     {"name": "Bazarr", "group": "Media", "side": "win", "port": 6767, "health": "http://127.0.0.1:6767/", "every": 120, "open": "http://127.0.0.1:6767/"},
+    {"name": "Spotifast (login)", "group": "Media", "side": "win", "port": 8989, "reserved": true, "process": "spotifast.exe"},
+    {"name": "Spotifast (playback approval)", "group": "Media", "side": "win", "port": 8898, "reserved": true, "process": "spotifast.exe"},
     {"name": "Sure", "group": "Homelab", "side": "wsl", "port": 3000, "docker": "sure-web-1", "health": "http://127.0.0.1:3000/up", "open": "http://127.0.0.1:3000/", "restart": "wsl:docker restart sure-web-1"},
     {"name": "Jetlog", "group": "Homelab", "side": "wsl", "port": 3001, "docker": "jetlog", "health": "http://127.0.0.1:3001/", "every": 60, "open": "http://127.0.0.1:3001/", "restart": "wsl:docker restart jetlog"},
     {"name": "KoInsight", "group": "Homelab", "side": "wsl", "port": 3003, "docker": "koinsight", "health": "http://127.0.0.1:3003/", "every": 60, "open": "http://127.0.0.1:3003/", "restart": "wsl:docker restart koinsight"},
