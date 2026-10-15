@@ -27,7 +27,9 @@
     {"name": "Tailscale serve", "group": "Remote access", "side": "win", "port": 443},
     {"name": "Windows sshd", "group": "Remote access", "side": "win", "port": 22},
     {"name": "WSL sshd", "group": "Remote access", "side": "wsl", "port": 2223},
-    {"name": "Chrome CDP", "group": "Dev tools", "side": "win", "port": 9222, "optional": true},
+    {"name": "Blender (MCP)", "group": "MCP", "side": "win", "port": 9876, "optional": true},
+    {"name": "FreeCAD (MCP)", "group": "MCP", "side": "win", "port": 9875, "optional": true},
+    {"name": "Chrome CDP (playwright-cdp)", "group": "MCP", "side": "win", "port": 9222, "optional": true, "health": "http://127.0.0.1:9222/json/version", "every": 60},
     {"name": "usbipd", "group": "Dev tools", "side": "win", "port": 3240, "optional": true}
   ]
 }

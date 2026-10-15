@@ -9,8 +9,8 @@ in [Xojo](https://xojo.com); a sibling of [LlamaTray](https://github.com/3-mmc/l
   before the first probe or when the config is missing. Inside the disc, LlamaTray's
   white bar shows VRAM use.
 - **Tooltip:** counts plus the names of anything not up, running models, VRAM.
-- **Click:** every service at a glance: status mark and name on the left, `:port` in a
-  right-aligned column. Each service has a submenu (Open, Restart…,
+- **Click:** every service at a glance: a coloured status dot in the menu's icon gutter
+  (hollow = idle), the name beside it, `:port` in a right-aligned column. Each service has a submenu (Open, Restart…,
   Copy port); the llama-swap entry also has LlamaTray's Unload / Unload all / Load menu,
   with the running models listed beneath it.
 - **Ephemeral:** listeners nobody configured that appeared *after* ServiceTray started,
@@ -87,6 +87,12 @@ created on first run. Use *Reload services.json* in the menu after editing.
 | `open` | URL for the Open item |
 | `restart` | command; a `wsl:` prefix runs it inside the distro |
 | `group` | category (AI, Media, …), shown as a sub-label or used for the category sort |
+
+MCP servers mostly speak stdio and open no port, so they cannot be watched directly. The
+example config instead watches the app each one drives (Blender addon :9876, FreeCAD bridge
+:9875, the CDP Chrome :9222) as optional entries in an `MCP` group. FreeCAD's bridge also
+opens a JSON-RPC socket on 9876, so with FreeCAD open and Blender closed the Blender line
+reads up.
 
 The top-level keys are `wslDistro`, `windowsEvery`, `wslEvery`, `healthEvery`,
 `ignorePorts`, `ignoreFrom` (unlisted ports at or above this are hidden; the default is

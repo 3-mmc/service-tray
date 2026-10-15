@@ -892,6 +892,49 @@ Inherits DesktopApplication
 		End Function
 	#tag EndMethod
 
+	#tag Method, Flags = &h21
+		Private Function Dot(st As Integer, big As Boolean = False) As Picture
+		  ' A coloured status dot for the menu's icon gutter, the column Windows keeps for
+		  ' checkmarks. Drawn at 1x, 1.5x and 2x so it stays sharp on scaled displays.
+		  If mDots = Nil Then mDots = New Dictionary
+		  Var key As String = st.ToString + If(big, "b", "")
+		  If mDots.HasKey(key) Then Return mDots.Value(key)
+		  Var c As Color = &c7F8C8D00
+		  Select Case st
+		  Case kStUp
+		    c = &c27AE6000
+		  Case kStDegraded
+		    c = &cE67E2200
+		  Case kStDown
+		    c = &cC0392B00
+		  Case kStEphemeral
+		    c = &c2E86DE00
+		  End Select
+		  Var reps() As Picture
+		  For Each scale As Double In Array(1.0, 1.5, 2.0)
+		    Var px As Integer = Round(16 * scale)
+		    Var p As New Picture(px, px)
+		    Var g As Graphics = p.Graphics
+		    g.AntiAliased = True
+		    g.DrawingColor = c
+		    Var d As Double = If(big, 12, 9) * scale
+		    If st = kStIdle Then
+		      ' Idle stays hollow, like the old ○.
+		      g.PenSize = Max(1, Round(1.5 * scale))
+		      g.DrawOval((px - d) / 2, (px - d) / 2, d, d)
+		    Else
+		      g.FillOval((px - d) / 2, (px - d) / 2, d, d)
+		    End If
+		    p.HorizontalResolution = 72 * scale
+		    p.VerticalResolution = 72 * scale
+		    reps.Add(p)
+		  Next
+		  Var pic As New Picture(16, 16, reps)
+		  mDots.Value(key) = pic
+		  Return pic
+		End Function
+	#tag EndMethod
+
 	#tag Method, Flags = &h0
 		Function Mark(st As Integer) As String
 		  Select Case st
@@ -912,9 +955,10 @@ Inherits DesktopApplication
 
 	#tag Method, Flags = &h21
 		Private Function MenuLine(name As String, st As Integer, port As Integer, detail As String) As String
-		  ' Mark, name and detail on the left; after the tab Windows right-aligns the port,
-		  ' so ports line up without leaving a wide gap before the status.
-		  Var left As String = "   " + Mark(st) + "   " + name.Trim
+		  ' The status is the item's icon (see Dot), so the text starts at the gutter. After
+		  ' the tab Windows right-aligns the port, so ports line up.
+		  #Pragma Unused st
+		  Var left As String = name.Trim
 		  If detail <> "" Then left = left + "  -  " + detail
 		  If port > 0 Then Return left + Chr(9) + ":" + port.ToString
 		  Return left
@@ -1245,13 +1289,14 @@ Inherits DesktopApplication
 		      Var ok, total As Integer
 		      Var worst As Integer = Rollup(members, ok, total)
 		      m.AddMenu(New DesktopMenuItem(DesktopMenuItem.TextSeparator))
-		      section = New DesktopMenuItem(Mark(worst) + "   " + li.Value("text").StringValue.Uppercase + Chr(9) + ok.ToString + "/" + total.ToString)
-		      ' Optional: a fully healthy section folds into its header line.
+		      section = New DesktopMenuItem(li.Value("text").StringValue.Uppercase + Chr(9) + ok.ToString + "/" + total.ToString)
+		      section.Icon = Dot(worst, True)
+		      ' Optional: a fully healthy section folds into its header line. Headers stay
+		      ' enabled even unfolded, because Windows greys a disabled item's icon.
 		      folded = mCollapseHealthy And ok = total
-		      section.Enabled = folded
 		      m.AddMenu(section)
 		    Case "sub"
-		      Var label As New DesktopMenuItem("         " + li.Value("text").StringValue)
+		      Var label As New DesktopMenuItem("   " + li.Value("text").StringValue)
 		      label.Enabled = False
 		      If folded Then section.AddMenu(label) Else m.AddMenu(label)
 		    Case "svc"
@@ -1260,12 +1305,13 @@ Inherits DesktopApplication
 		      Var stt As Integer = Status(sv, detail)
 		      Var name As String = GetStr(sv, "name")
 		      If mSortBy <> "environment" And GetStr(sv, "side") = "wsl" Then name = name + "  (WSL)"
-		      Var item As New DesktopMenuItem(MenuLine("      " + name, stt, GetInt(sv, "port", 0), detail))
+		      Var item As New DesktopMenuItem(MenuLine(name, stt, GetInt(sv, "port", 0), detail))
+		      item.Icon = Dot(stt)
 		      FillActions("svc:" + mServices.IndexOf(sv).ToString, item)
 		      If folded Then section.AddMenu(item) Else m.AddMenu(item)
 		      If sv = LlamaService Then
 		        For Each k As Variant In mRunning.Keys
-		          Var model As New DesktopMenuItem("                  " + ModelLabel(k.StringValue) + Chr(9) + mRunning.Value(k).StringValue)
+		          Var model As New DesktopMenuItem("      " + ModelLabel(k.StringValue) + Chr(9) + mRunning.Value(k).StringValue)
 		          model.Enabled = False
 		          If folded Then section.AddMenu(model) Else m.AddMenu(model)
 		        Next
@@ -1276,16 +1322,18 @@ Inherits DesktopApplication
 		  ' Listeners nobody configured. New ones (a dev server, a demo) get their own section.
 		  Var eph() As String = PortKeys(True)
 		  m.AddMenu(New DesktopMenuItem(DesktopMenuItem.TextSeparator))
-		  Var eh As New DesktopMenuItem(Mark(kStEphemeral) + "   EPHEMERAL" + Chr(9) + If(eph.Count = 0, "none", eph.Count.ToString))
-		  eh.Enabled = False
+		  Var eh As New DesktopMenuItem("EPHEMERAL" + Chr(9) + If(eph.Count = 0, "none", eph.Count.ToString))
+		  eh.Icon = Dot(kStEphemeral, True)
 		  m.AddMenu(eh)
 		  For Each k As String In eph
-		    Var item As New DesktopMenuItem(MenuLine("      " + PortOwner(k), kStEphemeral, Field(k, ":", 1).ToInteger, "since " + SeenText(k)))
+		    Var item As New DesktopMenuItem(MenuLine(PortOwner(k), kStEphemeral, Field(k, ":", 1).ToInteger, "since " + SeenText(k)))
+		    item.Icon = Dot(kStEphemeral)
 		    FillActions("port:" + k, item)
 		    m.AddMenu(item)
 		  Next
 		  Var other() As String = PortKeys(False)
-		  Var oh As New DesktopMenuItem("   " + Mark(kStIdle) + "   Other listeners" + Chr(9) + other.Count.ToString)
+		  Var oh As New DesktopMenuItem("Other listeners" + Chr(9) + other.Count.ToString)
+		  oh.Icon = Dot(kStIdle)
 		  For Each k As String In other
 		    Var item As New DesktopMenuItem(PortOwner(k) + Chr(9) + ":" + Field(k, ":", 1))
 		    FillActions("port:" + k, item)
@@ -1794,6 +1842,10 @@ Inherits DesktopApplication
 
 	#tag Property, Flags = &h21
 		Private mPortVerdict As Dictionary
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mDots As Dictionary
 	#tag EndProperty
 
 	#tag Property, Flags = &h21
