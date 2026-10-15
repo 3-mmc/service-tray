@@ -90,7 +90,7 @@ created on first run. Use *Reload services.json* in the menu after editing.
 
 MCP servers mostly speak stdio and open no port, so they cannot be watched directly. The
 example config instead watches the app each one drives (Blender addon :9876, FreeCAD bridge
-:9875, the CDP Chrome :9222) as optional entries in an `MCP` group. FreeCAD's bridge also
+:9875, Ghidra's GhidraMCP plugin :13100, the CDP Chrome :9222) as optional entries in an `MCP` group. FreeCAD's bridge also
 opens a JSON-RPC socket on 9876, so with FreeCAD open and Blender closed the Blender line
 reads up.
 
