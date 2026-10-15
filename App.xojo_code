@@ -1612,7 +1612,9 @@ Inherits DesktopApplication
 		  End If
 
 		  Var want() As String
-		  If GetStr(s, "process") <> "" Then want.Add(OwnerKey(GetStr(s, "process")))
+		  For Each alt As String In GetStr(s, "process").ToArray("|")
+		    If alt.Trim <> "" Then want.Add(OwnerKey(alt.Trim))
+		  Next
 		  Var name As String = GetStr(s, "name")
 		  If mLearnedOwner.HasKey(name) Then
 		    ' A generic owner (python3, svchost) shared with another service proves nothing.
@@ -1647,9 +1649,12 @@ Inherits DesktopApplication
 
 	#tag Method, Flags = &h21
 		Private Function OwnerMatches(who As String, process As String) As Boolean
-		  ' The Windows table can list several owners for one port ("tailscaled.exe, sshd.exe").
+		  ' The Windows table can list several owners for one port ("tailscaled.exe, sshd.exe"),
+		  ' and "process" can name alternatives ("codex|opencode" share one login callback).
 		  For Each part As String In who.ToArray(",")
-		    If OwnerKey(part.Trim.Replace(" (WSL)", "")) = OwnerKey(process) Then Return True
+		    For Each alt As String In process.ToArray("|")
+		      If OwnerKey(part.Trim.Replace(" (WSL)", "")) = OwnerKey(alt.Trim) Then Return True
+		    Next
 		  Next
 		  Return False
 		End Function

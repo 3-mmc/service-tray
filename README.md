@@ -107,7 +107,7 @@ services the container's published ports are used.
 | `open` | URL for the Open item |
 | `restart` | command; a `wsl:` prefix runs it inside the distro |
 | `group` | category (AI, Media, …), shown as a sub-label or used for the category sort |
-| `process` | exe (or WSL process) that owns the port: used for move detection, and anyone else holding the port shows as *taken by …* (degraded) |
+| `process` | exe (or WSL process) that owns the port, alternatives separated by `|` (`codex|opencode`): used for move detection, and anyone else holding the port shows as *taken by …* (degraded) |
 | `reserved` | a port kept free for a program that only listens now and then (Spotifast's OAuth callback on 8989): free = idle *free (reserved)*, its own program = up *in use*, anything else = degraded; never flagged as moved |
 
 MCP servers mostly speak stdio and open no port, so they cannot be watched directly. The

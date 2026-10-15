@@ -20,6 +20,7 @@
     {"name": "Bazarr", "group": "Media", "side": "win", "port": 6767, "health": "http://127.0.0.1:6767/", "every": 120, "open": "http://127.0.0.1:6767/"},
     {"name": "Spotifast (login)", "group": "Media", "side": "win", "port": 8989, "reserved": true, "process": "spotifast.exe"},
     {"name": "Spotifast (playback approval)", "group": "Media", "side": "win", "port": 8898, "reserved": true, "process": "spotifast.exe"},
+    {"name": "qBittorrent (incoming)", "group": "Media", "side": "win", "port": 19910, "reserved": true, "process": "qbittorrent.exe"},
     {"name": "Sure", "group": "Homelab", "side": "wsl", "port": 3000, "docker": "sure-web-1", "health": "http://127.0.0.1:3000/up", "open": "http://127.0.0.1:3000/", "restart": "wsl:docker restart sure-web-1"},
     {"name": "Jetlog", "group": "Homelab", "side": "wsl", "port": 3001, "docker": "jetlog", "health": "http://127.0.0.1:3001/", "every": 60, "open": "http://127.0.0.1:3001/", "restart": "wsl:docker restart jetlog"},
     {"name": "KoInsight", "group": "Homelab", "side": "wsl", "port": 3003, "docker": "koinsight", "health": "http://127.0.0.1:3003/", "every": 60, "open": "http://127.0.0.1:3003/", "restart": "wsl:docker restart koinsight"},
@@ -33,6 +34,7 @@
     {"name": "FreeCAD (MCP)", "group": "MCP", "side": "win", "port": 9875, "optional": true},
     {"name": "Ghidra (MCP)", "group": "MCP", "side": "win", "port": 13100, "optional": true},
     {"name": "Chrome CDP (playwright-cdp)", "group": "MCP", "side": "win", "port": 9222, "optional": true, "health": "http://127.0.0.1:9222/json/version", "every": 60},
+    {"name": "ChatGPT login (Codex, opencode)", "group": "Dev tools", "side": "wsl", "port": 1455, "reserved": true, "process": "codex|opencode"},
     {"name": "usbipd", "group": "Dev tools", "side": "win", "port": 3240, "optional": true}
   ]
 }
