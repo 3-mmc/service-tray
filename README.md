@@ -74,7 +74,18 @@ check only reports ports that actually fail.
 ## Configuration
 
 `%APPDATA%\ServiceTray\services.json`. See `services.example.json`. An empty file is
-created on first run. Use *Reload services.json* in the menu after editing.
+created on first run. Edits are picked up on their own: the file's modification time is
+checked on every Windows scan (5 s), and *Reload services.json* is still in the menu.
+
+**Moved services.** When a service's port goes quiet while its own process listens on a
+port nobody configured, the service shows as degraded with *Sonarr.exe is listening on
+:8990 instead* rather than down. Its submenu then offers *Use :8990*. *Change port...* is
+on every service. Both rewrite only that service's entry in `services.json` (its `port`
+and every `:<old port>` in its URLs), keep the hand formatting, and save the previous
+file as `services.json.bak`. The process is recognised by the `process` key, by the owner
+seen while the service was last up (unless another service shares it, as with
+`python3`), or by an exe named like the service (`Sonarr` = `Sonarr.exe`). For Docker
+services the container's published ports are used.
 
 | Key | Meaning |
 |---|---|
@@ -87,6 +98,7 @@ created on first run. Use *Reload services.json* in the menu after editing.
 | `open` | URL for the Open item |
 | `restart` | command; a `wsl:` prefix runs it inside the distro |
 | `group` | category (AI, Media, …), shown as a sub-label or used for the category sort |
+| `process` | exe (or WSL process) that serves it, for move detection when the name doesn't match |
 
 MCP servers mostly speak stdio and open no port, so they cannot be watched directly. The
 example config instead watches the app each one drives (Blender addon :9876, FreeCAD bridge

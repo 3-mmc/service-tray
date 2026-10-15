@@ -8,6 +8,7 @@ Module=WinPorts;WinPorts.xojo_code;&h000000002E4F6A1B;&h0000000000000000;false
 Module=PortProbe;PortProbe.xojo_code;&h000000005D2E7C11;&h0000000000000000;false
 DesktopWindow=DetailsWindow;DetailsWindow.xojo_window;&h00000000619AB3C7;&h0000000000000000;false
 DesktopWindow=PrefsWindow;PrefsWindow.xojo_window;&h0000000072C4D9E1;&h0000000000000000;false
+DesktopWindow=PortWindow;PortWindow.xojo_window;&h000000004A8C1F53;&h0000000000000000;false
 MenuBar=MainMenuBar;MainMenuBar.xojo_menu;&h000000003CB097FF;&h0000000000000000;false
 BuildSteps=Build Automation;Build Automation.xojo_code;&h00000000042787FF;&h0000000000000000;false
 DefaultWindow=

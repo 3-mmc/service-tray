@@ -27,6 +27,7 @@ Inherits DesktopApplication
 		  mAutoChecked = New Dictionary
 		  mRunning = New Dictionary
 		  mModelNames = New Dictionary
+		  mLearnedOwner = New Dictionary
 
 		  mTray = New TrayIcon
 		  mTray.Icon = MakeIcon(kColorUnknown)
@@ -290,11 +291,18 @@ Inherits DesktopApplication
 		  ElseIf tag = "edit" Then
 		    ConfigFile.Open
 		  ElseIf tag = "reload" Then
-		    LoadConfig
-		    mHealth = New Dictionary
-		    mLastKey = ""
-		    mLastStatus = ""
-		    RefreshNow
+		    ReloadConfig
+		  ElseIf tag.BeginsWith("adopt:") Then
+		    ' "adopt:<service index>:<port>": the service was found listening elsewhere.
+		    Var s As Dictionary = ServiceByKey("svc:" + Field(tag, ":", 1))
+		    If s <> Nil Then Call SetServicePort(s, Field(tag, ":", 2).ToInteger)
+		  ElseIf tag.BeginsWith("setport:") Then
+		    Var s As Dictionary = ServiceByKey("svc:" + tag.Middle(8))
+		    If s = Nil Then Return
+		    Var w As New PortWindow
+		    w.Prepare(GetStr(s, "name"), GetInt(s, "port", 0), MovedTo(s))
+		    w.ShowModal
+		    If w.Chosen > 0 And w.Chosen <> GetInt(s, "port", 0) Then Call SetServicePort(s, w.Chosen)
 		  ElseIf tag = "quit" Then
 		    Quit
 		  End If
@@ -342,6 +350,9 @@ Inherits DesktopApplication
 		  If GetStr(s, "restart") <> "" Then into.AddMenu(New DesktopMenuItem(If(s = LlamaService, "Restart gateway...", "Restart..."), "restart:" + key.Middle(4)))
 		  Var port As Integer = GetInt(s, "port", 0)
 		  If port > 0 Then into.AddMenu(New DesktopMenuItem("Copy port", "copy:" + port.ToString))
+		  Var moved As Integer = MovedTo(s)
+		  If moved > 0 Then into.AddMenu(New DesktopMenuItem("Use :" + moved.ToString + " (update services.json)", "adopt:" + key.Middle(4) + ":" + moved.ToString))
+		  into.AddMenu(New DesktopMenuItem("Change port...", "setport:" + key.Middle(4)))
 		  Var who As String = Owner(s)
 		  If who <> "" Then
 		    Var info As New DesktopMenuItem("Owner: " + who)
@@ -632,6 +643,8 @@ Inherits DesktopApplication
 		    Return
 		  End If
 
+		  ' Remembered so an edit made outside the app (an editor, an agent) is picked up.
+		  mConfigStamp = f.ModificationDateTime.SecondsFrom1970
 		  Try
 		    Var tin As TextInputStream = TextInputStream.Open(f)
 		    Var d As Dictionary = ParseJSON(tin.ReadAll(Encodings.UTF8))
@@ -1090,6 +1103,12 @@ Inherits DesktopApplication
 		    Var detail As String
 		    Var st As Integer = Status(s, detail)
 		    If Severity(st) > Severity(worst) Then worst = st
+		    ' Remember which process serves each port while it is up, so a later move to
+		    ' another port can be recognised (see MovedTo).
+		    If st = kStUp And GetInt(s, "port", 0) > 0 And GetStr(s, "docker") = "" Then
+		      Var who As String = Owner(s)
+		      If who <> "" Then mLearnedOwner.Value(GetStr(s, "name")) = who
+		    End If
 		    lines.Add(GetStr(s, "name") + Chr(9) + GetStr(s, "side") + Chr(9) + GetInt(s, "port", 0).ToString + Chr(9) + StatusWord(st) + Chr(9) + detail)
 		    Select Case st
 		    Case kStUp
@@ -1399,6 +1418,13 @@ Inherits DesktopApplication
 		  End If
 
 		  If Not listening Then
+		    ' Its own process listening on a port nobody configured: the service moved and
+		    ' services.json did not follow. Running, so degraded rather than down.
+		    Var moved As Integer = MovedTo(s)
+		    If moved > 0 Then
+		      detail = PortOwner(side + ":" + moved.ToString) + " is listening on :" + moved.ToString + " instead"
+		      Return kStDegraded
+		    End If
 		    detail = If(isOptional, "not running", "not listening")
 		    ' A port check that found the port unbindable explains why nothing can listen.
 		    If mPortVerdict.HasKey(port) Then detail = detail + ": port " + mPortVerdict.Value(port).StringValue
@@ -1458,6 +1484,9 @@ Inherits DesktopApplication
 		    UpdateSeen("win", mWinPorts)
 		    winScanned = True
 		    mDirty = True
+		    ' A changed services.json is reloaded on its own; the menu item stays for impatience.
+		    Var f As FolderItem = ConfigFile
+		    If f.Exists And f.ModificationDateTime.SecondsFrom1970 <> mConfigStamp Then Timer.CallLater(0, AddressOf ReloadConfig)
 		  End If
 		  ' While the details window is open, WSL is looked at more often.
 		  Var wslEvery As Integer = If(mDetails <> Nil, Min(mWslEvery, 5), mWslEvery)
@@ -1508,7 +1537,7 @@ Inherits DesktopApplication
 		    Var st As Integer = Status(s, detail)
 		    If st = kStUnknown Then Continue
 		    mHealthDue.Value(name) = mSeconds + GetInt(s, "every", mHealthEvery)
-		    If st = kStDown Or st = kStIdle Then
+		    If st = kStDown Or st = kStIdle Or MovedTo(s) > 0 Then
 		      If mHealth.HasKey(name) Then mHealth.Remove(name)
 		    Else
 		      HealthCheck(s)
@@ -1551,6 +1580,185 @@ Inherits DesktopApplication
 		    mWslBaselined = True
 		  End If
 		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function MovedTo(s As Dictionary) As Integer
+		  ' The lowest unlisted port held by this service's own process (or container) while
+		  ' its configured port is quiet, else 0. The process is the explicit "process" key,
+		  ' the owner seen while it was last up, or an exe named like the service
+		  ' ("Sonarr" -> Sonarr.exe). Ports in the ephemeral range and ignorePorts don't count.
+		  Var side As String = GetStr(s, "side")
+		  Var port As Integer = GetInt(s, "port", 0)
+		  If port = 0 Then Return 0
+		  If side = "wsl" Then
+		    If Not mWslKnown Or mWslPorts.HasKey(port) Then Return 0
+		  Else
+		    If Not mWinKnown Or mWinPorts.HasKey(port) Then Return 0
+		  End If
+
+		  Var want() As String
+		  If GetStr(s, "process") <> "" Then want.Add(OwnerKey(GetStr(s, "process")))
+		  Var name As String = GetStr(s, "name")
+		  If mLearnedOwner.HasKey(name) Then
+		    ' A generic owner (python3, svchost) shared with another service proves nothing.
+		    Var learned As String = mLearnedOwner.Value(name)
+		    Var isShared As Boolean
+		    For Each k As Variant In mLearnedOwner.Keys
+		      If k.StringValue <> name And mLearnedOwner.Value(k).StringValue = learned Then isShared = True
+		    Next
+		    If Not isShared Then want.Add(OwnerKey(learned))
+		  End If
+		  want.Add(OwnerKey(name))
+		  Var ct As String = GetStr(s, "docker")
+
+		  Var table As Dictionary = If(side = "wsl", mWslPorts, mWinPorts)
+		  Var best As Integer
+		  For Each k As Variant In table.Keys
+		    Var p As Integer = k.IntegerValue
+		    If p = port Or IsIgnored(p) Or IsListed(p, side) Then Continue
+		    If best > 0 And p >= best Then Continue
+		    Var hit As Boolean
+		    If side = "wsl" Then
+		      If ct <> "" Then hit = mDockerPorts.Lookup(p, "").StringValue = ct
+		      If Not hit And mWslOwners.HasKey(p) Then hit = want.IndexOf(OwnerKey(mWslOwners.Value(p).StringValue)) >= 0
+		    Else
+		      hit = want.IndexOf(OwnerKey(mWinPorts.Value(p).StringValue)) >= 0
+		    End If
+		    If hit Then best = p
+		  Next
+		  Return best
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function OwnerKey(who As String) As String
+		  ' "Sonarr.exe", "sonarr" and "Son arr" all compare equal.
+		  Var k As String = who.Lowercase.ReplaceAll(" ", "")
+		  If k.EndsWith(".exe") Then k = k.Left(k.Length - 4)
+		  Return k
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub ReloadConfig()
+		  LoadConfig
+		  mHealth = New Dictionary
+		  mLastKey = ""
+		  mLastStatus = ""
+		  ' A port a service now claims is no longer an unlisted listener.
+		  Var claimed() As String
+		  For Each k As Variant In mSeen.Keys
+		    If IsListed(Field(k.StringValue, ":", 1).ToInteger, Field(k.StringValue, ":", 0)) Then claimed.Add(k.StringValue)
+		  Next
+		  For Each k As String In claimed
+		    mSeen.Remove(k)
+		  Next
+		  RefreshNow
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function SetServicePort(s As Dictionary, newPort As Integer) As Boolean
+		  ' Rewrites only this service's object in services.json, as text, so the hand
+		  ' formatting survives: its "port" and every ":<old>" in its URLs (health, open) follow.
+		  ' The previous file is kept as services.json.bak.
+		  If newPort <= 0 Or newPort > 65535 Then Return False
+		  Var oldPort As Integer = GetInt(s, "port", 0)
+		  Var f As FolderItem = ConfigFile
+		  Var problem As String
+		  Try
+		    Var tin As TextInputStream = TextInputStream.Open(f)
+		    Var body As String = tin.ReadAll(Encodings.UTF8)
+		    tin.Close
+
+		    Var re As New RegEx
+		    re.SearchPattern = """name""\s*:\s*""" + RegexEscape(GetStr(s, "name")) + """"
+		    Var m As RegExMatch = re.Search(body)
+		    Var a, b As Integer
+		    If m = Nil Then
+		      problem = "its entry was not found"
+		    ElseIf Not ObjectBounds(body, m.SubExpressionStartB(0), a, b) Then
+		      problem = "its entry could not be delimited"
+		    Else
+		      Var obj As String = body.MiddleBytes(a, b - a)
+		      Var rp As New RegEx
+		      rp.Options.ReplaceAllMatches = True
+		      If oldPort > 0 Then
+		        rp.SearchPattern = """port""\s*:\s*" + oldPort.ToString + "\b"
+		        rp.ReplacementPattern = """port"": " + newPort.ToString
+		        obj = rp.Replace(obj)
+		        rp.SearchPattern = ":" + oldPort.ToString + "(?=[/""])"
+		        rp.ReplacementPattern = ":" + newPort.ToString
+		        obj = rp.Replace(obj)
+		      Else
+		        obj = obj.Replace(m.SubExpressionString(0), m.SubExpressionString(0) + ", ""port"": " + newPort.ToString)
+		      End If
+		      Var bak As TextOutputStream = TextOutputStream.Create(f.Parent.Child("services.json.bak"))
+		      bak.Write(body)
+		      bak.Close
+		      Var out As TextOutputStream = TextOutputStream.Create(f)
+		      out.Write(body.LeftBytes(a) + obj + body.MiddleBytes(b))
+		      out.Close
+		    End If
+		  Catch e As RuntimeException
+		    problem = e.Message
+		  End Try
+		  If problem <> "" Then
+		    MessageBox("Could not change the port of " + GetStr(s, "name") + ": " + problem + "." + EndOfLine + "Use Edit services.json instead.")
+		    Return False
+		  End If
+		  ReloadConfig
+		  Return True
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function ObjectBounds(body As String, pos As Integer, ByRef a As Integer, ByRef b As Integer) As Boolean
+		  ' Byte offsets [a, b) of the innermost JSON object around byte pos, skipping strings.
+		  Var mb As MemoryBlock = body
+		  Var stack() As Integer
+		  Var depth As Integer = -1
+		  Var inStr, esc As Boolean
+		  For i As Integer = 0 To mb.Size - 1
+		    If i = pos Then
+		      If stack.Count = 0 Then Return False
+		      depth = stack.Count
+		      a = stack(stack.LastIndex)
+		    End If
+		    Var c As Integer = mb.Byte(i)
+		    If inStr Then
+		      If esc Then
+		        esc = False
+		      ElseIf c = 92 Then
+		        esc = True
+		      ElseIf c = 34 Then
+		        inStr = False
+		      End If
+		    ElseIf c = 34 Then
+		      inStr = True
+		    ElseIf c = 123 Then
+		      stack.Add(i)
+		    ElseIf c = 125 And stack.Count > 0 Then
+		      If stack.Count = depth Then
+		        b = i + 1
+		        Return True
+		      End If
+		      stack.RemoveAt(stack.LastIndex)
+		    End If
+		  Next
+		  Return False
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function RegexEscape(s As String) As String
+		  Var out As String = s
+		  For Each ch As String In Array("\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}")
+		    out = out.ReplaceAll(ch, "\" + ch)
+		  Next
+		  Return out
+		End Function
 	#tag EndMethod
 
 	#tag Method, Flags = &h21
@@ -1663,6 +1871,14 @@ Inherits DesktopApplication
 		End Function
 	#tag EndMethod
 
+
+	#tag Property, Flags = &h21
+		Private mConfigStamp As Double
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mLearnedOwner As Dictionary
+	#tag EndProperty
 
 	#tag Property, Flags = &h21
 		Private mSortBy As String
