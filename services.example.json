@@ -8,11 +8,14 @@
   "collapseHealthy": false,
   "checkPorts": ["11520-11554", 11600, 11434, 8080],
   "llamaSwap": {"url": "http://127.0.0.1:9292", "service": "llama-swap"},
+  "serverTitle": "Home server",
+  "servers": {"192.168.1.32": "media VM", "192.168.1.210": "arr VM"},
 
   "services": [
     {"name": "llama-swap", "group": "AI", "side": "win", "port": 9292, "health": "http://127.0.0.1:9292/running", "every": 10, "open": "http://127.0.0.1:9292/ui/", "restart": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"& 'D:\\llama-swap\\gateway.ps1' stop; & 'D:\\llama-swap\\gateway.ps1' start\""},
     {"name": "ComfyUI", "group": "AI", "side": "win", "port": 11600, "optional": true, "open": "http://127.0.0.1:11600/"},
     {"name": "Ollama (standalone)", "group": "AI", "side": "win", "port": 11434, "optional": true},
+    {"name": "Speech room (TTS)", "group": "AI", "side": "wsl", "port": 11610, "reserved": true, "process": "python|python3", "health": "http://127.0.0.1:11610/health", "every": 30, "open": "http://127.0.0.1:9292/upstream/tts/"},
     {"name": "Plex", "group": "Media", "side": "win", "port": 32400, "health": "http://127.0.0.1:32400/identity", "every": 60, "open": "http://127.0.0.1:32400/web"},
     {"name": "Jellyfin", "group": "Media", "side": "win", "port": 8096, "health": "http://127.0.0.1:8096/health", "every": 60, "open": "http://127.0.0.1:8096/"},
     {"name": "Radarr", "group": "Media", "side": "win", "port": 7878, "health": "http://127.0.0.1:7878/ping", "every": 120, "open": "http://127.0.0.1:7878/"},
@@ -35,6 +38,8 @@
     {"name": "Ghidra (MCP)", "group": "MCP", "side": "win", "port": 13100, "optional": true},
     {"name": "Chrome CDP (playwright-cdp)", "group": "MCP", "side": "win", "port": 9222, "optional": true, "health": "http://127.0.0.1:9222/json/version", "every": 60},
     {"name": "ChatGPT login (Codex, opencode)", "group": "Dev tools", "side": "wsl", "port": 1455, "reserved": true, "process": "codex|opencode"},
-    {"name": "usbipd", "group": "Dev tools", "side": "win", "port": 3240, "optional": true}
+    {"name": "usbipd", "group": "Dev tools", "side": "win", "port": 3240, "optional": true},
+    {"name": "Jetlog", "group": "Homelab", "side": "server", "host": "192.168.1.32", "port": 3001, "health": "http://192.168.1.32:3001/", "every": 60, "open": "http://192.168.1.32:3001/"},
+    {"name": "Sonarr", "group": "Media", "side": "server", "host": "192.168.1.210", "port": 8989, "health": "http://192.168.1.210:8989/ping", "every": 120, "open": "http://192.168.1.210:8989/"}
   ]
 }

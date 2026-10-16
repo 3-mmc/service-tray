@@ -28,6 +28,10 @@ Inherits DesktopApplication
 		  mRunning = New Dictionary
 		  mModelNames = New Dictionary
 		  mLearnedOwner = New Dictionary
+		  mRemote = New Dictionary
+		  mRemoteConns = New Dictionary
+		  mRemoteStarted = New Dictionary
+		  mServerNames = New Dictionary
 
 		  mTray = New TrayIcon
 		  mTray.Icon = MakeIcon(kColorUnknown)
@@ -222,7 +226,7 @@ Inherits DesktopApplication
 		      Var stt As Integer = Status(sv, detail)
 		      Var port As Integer = GetInt(sv, "port", 0)
 		      rows.Add(Row("service", stt, "svc:" + mServices.IndexOf(sv).ToString, _
-		      "    " + GetStr(sv, "name"), StatusWord(stt), If(port > 0, port.ToString, ""), If(GetStr(sv, "side") = "wsl", "WSL", "Windows"), Owner(sv), detail))
+		      "    " + GetStr(sv, "name"), StatusWord(stt), If(port > 0, port.ToString, ""), EnvName(sv), Owner(sv), detail))
 		      If sv = LlamaService Then
 		        For Each k As Variant In mRunning.Keys
 		          rows.Add(Row("model", If(mRunning.Value(k).StringValue = "ready", kStUp, kStDegraded), "model:" + k.StringValue, _
@@ -242,6 +246,19 @@ Inherits DesktopApplication
 		  For Each k As String In other
 		    rows.Add(Row("port", kStIdle, "port:" + k, "    " + PortOwner(k), "listening", Field(k, ":", 1), SideName(Field(k, ":", 0)), PortOwner(k), "already up at start"))
 		  Next
+
+		  Var res() As Dictionary = ReservedServices
+		  If res.Count > 0 Then
+		    Var ok, total As Integer
+		    Var worst As Integer = Rollup(res, ok, total)
+		    rows.Add(Row("group", worst, "", "Reserved ports", ok.ToString + "/" + total.ToString + " ok", "", "", "", ""))
+		    For Each sv As Dictionary In res
+		      Var detail As String
+		      Var stt As Integer = Status(sv, detail)
+		      rows.Add(Row("service", stt, "svc:" + mServices.IndexOf(sv).ToString, _
+		      "    " + GetStr(sv, "name"), StatusWord(stt), GetInt(sv, "port", 0).ToString, EnvName(sv), Owner(sv), detail))
+		    Next
+		  End If
 
 		  If mPortCheckTime <> Nil Then
 		    rows.Add(Row("group", kStUnknown, "", "Port check", mPortVerdict.KeyCount.ToString + " of " + mPortCheckCount.ToString + " unbindable", "", "", "", _
@@ -350,6 +367,7 @@ Inherits DesktopApplication
 		  If GetStr(s, "restart") <> "" Then into.AddMenu(New DesktopMenuItem(If(s = LlamaService, "Restart gateway...", "Restart..."), "restart:" + key.Middle(4)))
 		  Var port As Integer = GetInt(s, "port", 0)
 		  If port > 0 Then into.AddMenu(New DesktopMenuItem("Copy port", "copy:" + port.ToString))
+		  If port > 0 And GetStr(s, "side") = "server" Then into.AddMenu(New DesktopMenuItem("Copy address", "copy:" + GetStr(s, "host") + ":" + port.ToString))
 		  Var moved As Integer = MovedTo(s)
 		  If moved > 0 Then into.AddMenu(New DesktopMenuItem("Use :" + moved.ToString + " (update services.json)", "adopt:" + key.Middle(4) + ":" + moved.ToString))
 		  into.AddMenu(New DesktopMenuItem("Change port...", "setport:" + key.Middle(4)))
@@ -380,7 +398,7 @@ Inherits DesktopApplication
 		Private Function GroupOf(s As Dictionary) As String
 		  Var g As String = GetStr(s, "group")
 		  If g <> "" Then Return g
-		  Return If(GetStr(s, "side") = "wsl", "WSL", "Windows")
+		  Return EnvName(s)
 		End Function
 	#tag EndMethod
 
@@ -543,6 +561,100 @@ Inherits DesktopApplication
 	#tag EndMethod
 
 	#tag Method, Flags = &h21
+		Private Function EnvName(s As Dictionary) As String
+		  Select Case GetStr(s, "side")
+		  Case "wsl"
+		    Return "WSL"
+		  Case "server"
+		    Return HostName(s)
+		  End Select
+		  Return "Windows"
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function HostLabel(s As Dictionary) As String
+		  ' "borsippa  192.168.1.32", or just the address when servers{} does not name it.
+		  Var host As String = GetStr(s, "host")
+		  Var name As String = HostName(s)
+		  Return If(name = host, host, name + "  " + host)
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function HostName(s As Dictionary) As String
+		  Var host As String = GetStr(s, "host")
+		  Return mServerNames.Lookup(host, host).StringValue
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function IsReserved(s As Dictionary) As Boolean
+		  Return s.HasKey("reserved") And s.Value("reserved").BooleanValue
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub ProbeServers()
+		  ' One TCP connect per distinct host:port of the "server" services; an open port is
+		  ' all that is learned here, the health URL (if any) says the rest.
+		  For Each s As Dictionary In mServices
+		    If GetStr(s, "side") <> "server" Or GetInt(s, "port", 0) = 0 Then Continue
+		    Var addr As String = GetStr(s, "host") + ":" + GetInt(s, "port", 0).ToString
+		    If mRemoteStarted.HasKey(addr) Then Continue
+		    Var t As New TCPSocket
+		    t.Address = GetStr(s, "host")
+		    t.Port = GetInt(s, "port", 0)
+		    AddHandler t.Connected, WeakAddressOf RemoteConnected
+		    AddHandler t.Error, WeakAddressOf RemoteError
+		    ' Held here until it answers; the value says which address it is testing.
+		    mRemoteConns.Value(t) = addr
+		    mRemoteStarted.Value(addr) = System.Microseconds
+		    t.Connect
+		  Next
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub RemoteConnected(sender As TCPSocket)
+		  RemoteDone(sender, True)
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub RemoteDone(sender As TCPSocket, open As Boolean)
+		  If Not mRemoteConns.HasKey(sender) Then Return
+		  Var addr As String = mRemoteConns.Value(sender)
+		  mRemoteConns.Remove(sender)
+		  If mRemoteStarted.HasKey(addr) Then mRemoteStarted.Remove(addr)
+		  mRemote.Value(addr) = open
+		  mDirty = True
+		  ' Removed above first, so an Error raised by the disconnect is ignored.
+		  Try
+		    sender.Disconnect
+		  Catch e As RuntimeException
+		  End Try
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Sub RemoteError(sender As TCPSocket, e As RuntimeException)
+		  #Pragma Unused e
+		  RemoteDone(sender, False)
+		End Sub
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
+		Private Function ReservedServices() As Dictionary()
+		  Var out() As Dictionary
+		  For Each s As Dictionary In mServices
+		    If IsReserved(s) Then out.Add(s)
+		  Next
+		  Return out
+		End Function
+	#tag EndMethod
+
+	#tag Method, Flags = &h21
 		Private Function IsListed(port As Integer, side As String) As Boolean
 		  For Each s As Dictionary In mServices
 		    If GetInt(s, "port", 0) = port And GetStr(s, "side") = side Then Return True
@@ -633,6 +745,9 @@ Inherits DesktopApplication
 		  mCollapseHealthy = False
 		  mLlamaUrl = ""
 		  mLlamaName = ""
+		  mServerNames = New Dictionary
+		  mServerTitle = "Server"
+		  mRemoteEvery = 30
 
 		  Var f As FolderItem = ConfigFile
 		  If Not f.Exists Then
@@ -673,6 +788,15 @@ Inherits DesktopApplication
 		        Next
 		      Next
 		    End If
+		    ' servers: {"192.168.1.32": "borsippa", …} names the machines "side": "server" points at.
+		    mRemoteEvery = Max(5, GetInt(d, "serverEvery", mRemoteEvery))
+		    If GetStr(d, "serverTitle") <> "" Then mServerTitle = GetStr(d, "serverTitle")
+		    If d.HasKey("servers") Then
+		      Var sd As Dictionary = d.Value("servers")
+		      For Each k As Variant In sd.Keys
+		        mServerNames.Value(k.StringValue) = sd.Value(k).StringValue
+		      Next
+		    End If
 		    If d.HasKey("llamaSwap") Then
 		      Var ls As Dictionary = d.Value("llamaSwap")
 		      mLlamaUrl = GetStr(ls, "url")
@@ -699,6 +823,7 @@ Inherits DesktopApplication
 		  ' (a quiet category label) and "svc" entries, per the Preferences sort.
 		  Var shown() As Dictionary
 		  For Each sv As Dictionary In mServices
+		    If IsReserved(sv) Then Continue
 		    Var port As Integer = GetInt(sv, "port", 0)
 		    If mPortFrom > 0 And port > 0 And port < mPortFrom Then Continue
 		    If mPortTo > 0 And port > mPortTo Then Continue
@@ -734,14 +859,17 @@ Inherits DesktopApplication
 		    keys.SortWith(members)
 		    AddSection(out, If(mSortBy = "port", "By port", "By name"), members, False)
 		  Else
-		    ' Environment: Windows, then WSL, each with its categories as sub-labels.
-		    Var sides() As String = Array("win", "wsl")
+		    ' Environment: Windows, then WSL, each with its categories as sub-labels, then the
+		    ' server machines, labelled by host instead.
+		    Var sides() As String = Array("win", "wsl", "server")
 		    For Each side As String In sides
 		      Var members() As Dictionary
 		      For Each sv As Dictionary In shown
 		        If GetStr(sv, "side") = side Then members.Add(sv)
 		      Next
-		      AddSection(out, If(side = "win", "Windows", "WSL (" + mDistro + ")" + If(mWslKnown And Not mWslRunning, ": not running", "")), members, mShowCategories)
+		      Var title As String = If(side = "win", "Windows", "WSL (" + mDistro + ")" + If(mWslKnown And Not mWslRunning, ": not running", ""))
+		      If side = "server" Then title = mServerTitle
+		      AddSection(out, title, members, mShowCategories Or side = "server", side = "server")
 		    Next
 		  End Select
 		  Return out
@@ -749,7 +877,7 @@ Inherits DesktopApplication
 	#tag EndMethod
 
 	#tag Method, Flags = &h21
-		Private Sub AddSection(out() As Dictionary, title As String, members() As Dictionary, withCategories As Boolean)
+		Private Sub AddSection(out() As Dictionary, title As String, members() As Dictionary, withCategories As Boolean, byHost As Boolean = False)
 		  If members.Count = 0 Then Return
 		  Var head As New Dictionary
 		  head.Value("kind") = "head"
@@ -762,15 +890,16 @@ Inherits DesktopApplication
 		    Next
 		    Return
 		  End If
-		  ' Categories in config order; a service without one sits at the top of the section.
+		  ' Categories (or hosts) in config order; a service without one sits at the top.
 		  Var cats() As String
 		  For Each sv As Dictionary In members
-		    If cats.IndexOf(GetStr(sv, "group")) < 0 Then cats.Add(GetStr(sv, "group"))
+		    Var c As String = If(byHost, HostLabel(sv), GetStr(sv, "group"))
+		    If cats.IndexOf(c) < 0 Then cats.Add(c)
 		  Next
 		  For Each c As String In cats
 		    If c <> "" Then out.Add(MakeEntry("sub", c, Nil))
 		    For Each sv As Dictionary In members
-		      If GetStr(sv, "group") = c Then out.Add(MakeEntry("svc", "", sv))
+		      If If(byHost, HostLabel(sv), GetStr(sv, "group")) = c Then out.Add(MakeEntry("svc", "", sv))
 		    Next
 		  Next
 		End Sub
@@ -1026,6 +1155,7 @@ Inherits DesktopApplication
 	#tag Method, Flags = &h21
 		Private Function Owner(s As Dictionary) As String
 		  Var port As Integer = GetInt(s, "port", 0)
+		  If GetStr(s, "side") = "server" Then Return HostLabel(s)
 		  If GetStr(s, "side") = "wsl" Then
 		    If GetStr(s, "docker") <> "" And mContainers.HasKey(GetStr(s, "docker")) Then
 		      Return "docker " + GetStr(s, "docker") + " (" + mContainers.Value(GetStr(s, "docker")).StringValue + ")"
@@ -1109,7 +1239,7 @@ Inherits DesktopApplication
 		      Var who As String = Owner(s)
 		      If who <> "" Then mLearnedOwner.Value(GetStr(s, "name")) = who
 		    End If
-		    lines.Add(GetStr(s, "name") + Chr(9) + GetStr(s, "side") + Chr(9) + GetInt(s, "port", 0).ToString + Chr(9) + StatusWord(st) + Chr(9) + detail)
+		    lines.Add(GetStr(s, "name") + Chr(9) + If(GetStr(s, "side") = "server", GetStr(s, "host"), GetStr(s, "side")) + Chr(9) + GetInt(s, "port", 0).ToString + Chr(9) + StatusWord(st) + Chr(9) + detail)
 		    Select Case st
 		    Case kStUp
 		      up = up + 1
@@ -1184,6 +1314,7 @@ Inherits DesktopApplication
 		Sub RefreshNow()
 		  mHealthDue = New Dictionary
 		  mSeconds = -1
+		  mRemoteDue = 0
 		  mGpuDue = 0
 		  If mLlamaPolling Then PollLlama(True)
 		  Tick(mTimer)
@@ -1324,6 +1455,7 @@ Inherits DesktopApplication
 		      Var stt As Integer = Status(sv, detail)
 		      Var name As String = GetStr(sv, "name")
 		      If mSortBy <> "environment" And GetStr(sv, "side") = "wsl" Then name = name + "  (WSL)"
+		      If mSortBy <> "environment" And GetStr(sv, "side") = "server" Then name = name + "  (" + HostName(sv) + ")"
 		      Var item As New DesktopMenuItem(MenuLine(name, stt, GetInt(sv, "port", 0), detail))
 		      item.Icon = Dot(stt)
 		      FillActions("svc:" + mServices.IndexOf(sv).ToString, item)
@@ -1360,6 +1492,26 @@ Inherits DesktopApplication
 		  Next
 		  oh.Enabled = other.Count > 0
 		  m.AddMenu(oh)
+		  ' Reserved ports wait for programs that listen only now and then, so they fold away
+		  ' too. The header's dot still turns amber when something else holds one.
+		  Var res() As Dictionary = ReservedServices
+		  If res.Count > 0 Then
+		    Var ok, total As Integer
+		    Var worst As Integer = Rollup(res, ok, total)
+		    Var rh As New DesktopMenuItem("Reserved ports" + Chr(9) + If(ok = total, total.ToString, Str(total - ok) + " taken"))
+		    rh.Icon = Dot(If(ok = total, kStIdle, worst))
+		    For Each sv As Dictionary In res
+		      Var detail As String
+		      Var stt As Integer = Status(sv, detail)
+		      Var name As String = GetStr(sv, "name")
+		      If GetStr(sv, "side") = "wsl" Then name = name + "  (WSL)"
+		      Var item As New DesktopMenuItem(MenuLine(name, stt, GetInt(sv, "port", 0), detail))
+		      item.Icon = Dot(stt)
+		      FillActions("svc:" + mServices.IndexOf(sv).ToString, item)
+		      rh.AddMenu(item)
+		    Next
+		    m.AddMenu(rh)
+		  End If
 
 		  m.AddMenu(New DesktopMenuItem(DesktopMenuItem.TextSeparator))
 		  m.AddMenu(New DesktopMenuItem("Details...", "details"))
@@ -1415,6 +1567,17 @@ Inherits DesktopApplication
 		      End If
 		    End If
 		    listening = (port = 0) Or mWslPorts.HasKey(port)
+		  ElseIf side = "server" Then
+		    ' Another machine: no port table, just whether a TCP connect succeeds (ProbeServers).
+		    Var addr As String = GetStr(s, "host") + ":" + port.ToString
+		    If port > 0 Then
+		      If Not mRemote.HasKey(addr) Then Return kStUnknown
+		      If Not mRemote.Value(addr).BooleanValue Then
+		        detail = "no answer from " + addr
+		        Return If(isOptional, kStIdle, kStDown)
+		      End If
+		    End If
+		    listening = True
 		  Else
 		    If Not mWinKnown Then Return kStUnknown
 		    listening = (port = 0) Or mWinPorts.HasKey(port)
@@ -1532,6 +1695,16 @@ Inherits DesktopApplication
 		    If Not mGpuShell.IsRunning Then mGpuShell.Execute("nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits")
 		  End If
 
+		  If mSeconds >= mRemoteDue Then
+		    mRemoteDue = mSeconds + mRemoteEvery
+		    ProbeServers
+		  End If
+		  ' A machine that is off never answers a connect; after 8 s that counts as no answer.
+		  For Each k As Variant In mRemoteConns.Keys
+		    Var addr As String = mRemoteConns.Value(k)
+		    If System.Microseconds - mRemoteStarted.Lookup(addr, 0.0).DoubleValue >= 8000000 Then RemoteDone(TCPSocket(k.ObjectValue), False)
+		  Next
+
 		  For Each s As Dictionary In mServices
 		    Var name As String = GetStr(s, "name")
 		    ' A required Windows service whose port went quiet: find out whether the port
@@ -1604,7 +1777,7 @@ Inherits DesktopApplication
 		  ' ("Sonarr" -> Sonarr.exe). Ports in the ephemeral range and ignorePorts don't count.
 		  Var side As String = GetStr(s, "side")
 		  Var port As Integer = GetInt(s, "port", 0)
-		  If port = 0 Then Return 0
+		  If port = 0 Or side = "server" Then Return 0
 		  If side = "wsl" Then
 		    If Not mWslKnown Or mWslPorts.HasKey(port) Then Return 0
 		  Else
@@ -1900,6 +2073,34 @@ Inherits DesktopApplication
 		End Function
 	#tag EndMethod
 
+
+	#tag Property, Flags = &h21
+		Private mRemote As Dictionary
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mRemoteConns As Dictionary
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mRemoteDue As Integer
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mRemoteEvery As Integer
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mRemoteStarted As Dictionary
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mServerNames As Dictionary
+	#tag EndProperty
+
+	#tag Property, Flags = &h21
+		Private mServerTitle As String
+	#tag EndProperty
 
 	#tag Property, Flags = &h21
 		Private mConfigStamp As Double

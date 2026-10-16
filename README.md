@@ -25,12 +25,13 @@ the menu on the left and *Details...* on the right.
 - **Ephemeral:** listeners nobody configured that appeared *after* ServiceTray started,
   such as a dev server or a demo on `localhost:xxxx`, with owner and start time. WSL
   processes are named when they run as your user (`python3 (WSL)`). Whatever was already
-  listening at start goes under *Other listeners*.
+  listening at start goes under *Other listeners*, and `reserved` ports fold into a
+  *Reserved ports* submenu beside it (its dot turns amber when something else holds one).
 - **Details…:** a window with the same sections as a table (status, port, side, owner,
   detail). Double-click opens a service; right-click gives the same actions as the menu.
   WSL is polled every 5 s while it is open.
-- **Preferences…:** sort by environment (Windows / WSL, categories as grey sub-labels;
-  the default), by category, by port or by name; fold fully healthy sections; hide idle
+- **Preferences…:** sort by environment (Windows / WSL / your server machines, categories as
+  grey sub-labels, server services under their host; the default), by category, by port or by name; fold fully healthy sections; hide idle
   optional services; show only a port range (e.g. 3000–9999). Saved to `settings.json`.
 - **Check ports…:** see below.
 - **Double-click:** refresh now.
@@ -45,6 +46,7 @@ the menu on the left and *Details...* on the right.
 | WSL listeners + Docker | one `wsl.exe -e sh -c "ss -ltnH; docker ps -a …"` call | 15 s |
 | Health | HTTP GET per service, only while its port is listening | per service (`every`), default 30 s |
 | llama-swap | one long-lived `GET /api/events` stream; model changes are pushed (falls back to LlamaTray's `/running` polling if the stream never delivers) | push |
+| Server machines | a TCP connect per `host:port` (8 s timeout), then the health URL | `serverEvery`, default 30 s |
 | VRAM | `nvidia-smi` | 5 s while a model is loaded, else 30 s |
 
 Under WSL's **mirrored networking**, WSL's listening ports do not show up in Windows'
@@ -98,7 +100,8 @@ services the container's published ports are used.
 
 | Key | Meaning |
 |---|---|
-| `side` | `win` or `wsl` |
+| `side` | `win`, `wsl`, or `server` (another machine on the network; needs `host`) |
+| `host` | for `server`: the machine's address, named via the top-level `servers` |
 | `port` | the port that must be listening (0 = don't check) |
 | `health` | URL; any HTTP status below 500 counts as alive |
 | `every` | seconds between health checks for this service |
@@ -119,7 +122,9 @@ reads up.
 The top-level keys are `wslDistro`, `windowsEvery`, `wslEvery`, `healthEvery`,
 `ignorePorts`, `ignoreFrom` (unlisted ports at or above this are hidden; the default is
 49152, the ephemeral range), `checkPorts`, and `llamaSwap` (`{"url": …, "service": <name
-of the llama-swap entry>}`, which turns on the model menu).
+of the llama-swap entry>}`, which turns on the model menu), `servers` (`{"192.168.1.32":
+"media VM", …}`, the names shown above each host's services), `serverTitle` (the section
+header, default *Server*) and `serverEvery`.
 
 View options live separately in `settings.json`, written by the Preferences window.
 
