@@ -1,0 +1,37 @@
+{
+  "localEvery": 5,
+  "dockerEvery": 15,
+  "healthEvery": 30,
+  "ignorePorts": [53, 5355],
+  "checkPorts": [11600, 11610],
+  "llamaSwap": {"url": "http://127.0.0.1:9292", "service": "llama-swap"},
+  "serverTitle": "Home server",
+  "servers": {"192.168.1.200": "pve (Proxmox host)", "192.168.1.32": "borsippa (media VM)", "192.168.1.210": "arr VM", "192.168.1.201": "Plex VM"},
+  "serverEvery": 30,
+
+  "services": [
+    {"name": "llama-swap", "group": "AI", "port": 9292, "unit": "llama-swap.service", "process": "llama-swap", "health": "http://127.0.0.1:9292/running", "every": 10, "open": "http://127.0.0.1:9292/ui/"},
+    {"name": "ComfyUI", "group": "AI", "port": 11600, "optional": true, "open": "http://127.0.0.1:9292/upstream/comfyui_auto/"},
+    {"name": "Speech room (TTS)", "group": "AI", "port": 11610, "reserved": true, "process": "python|python3", "health": "http://127.0.0.1:11610/health", "every": 30, "open": "http://127.0.0.1:9292/upstream/tts/"},
+    {"name": "MPD", "group": "Media", "port": 6600, "unit": "mpd.service", "process": "mpd"},
+    {"name": "Sure", "group": "Homelab", "optional": true, "port": 3000, "docker": "sure-web-1", "health": "http://127.0.0.1:3000/up", "open": "http://127.0.0.1:3000/"},
+    {"name": "BirdNET-Go", "group": "Homelab", "optional": true, "port": 3004, "docker": "birdnet-go", "health": "http://127.0.0.1:3004/", "open": "http://127.0.0.1:3004/"},
+    {"name": "Gramps Web", "group": "Homelab", "optional": true, "port": 3005, "docker": "grampsweb-grampsweb-1", "health": "http://127.0.0.1:3005/", "every": 120, "open": "http://127.0.0.1:3005/"},
+    {"name": "sshd", "group": "Remote access", "port": 22, "unit": "system:sshd.service"},
+    {"name": "Blender (MCP)", "group": "MCP", "port": 9876, "optional": true},
+    {"name": "FreeCAD (MCP)", "group": "MCP", "port": 9875, "optional": true},
+    {"name": "Ghidra (MCP)", "group": "MCP", "port": 13100, "optional": true},
+    {"name": "Chrome CDP (playwright-cdp)", "group": "MCP", "port": 9222, "optional": true, "health": "http://127.0.0.1:9222/json/version", "every": 60},
+    {"name": "ChatGPT login (Codex, opencode)", "group": "Dev tools", "port": 1455, "reserved": true, "process": "codex|opencode"},
+    {"name": "Proxmox", "group": "Host", "side": "server", "host": "192.168.1.200", "port": 8006, "open": "https://192.168.1.200:8006/"},
+    {"name": "Jetlog", "group": "Homelab", "side": "server", "host": "192.168.1.32", "port": 3001, "health": "http://192.168.1.32:3001/", "every": 60, "open": "http://192.168.1.32:3001/"},
+    {"name": "Plex", "group": "Media", "side": "server", "host": "192.168.1.32", "port": 32400, "health": "http://192.168.1.32:32400/identity", "every": 60, "open": "http://192.168.1.32:32400/web"},
+    {"name": "Jellyfin", "group": "Media", "side": "server", "host": "192.168.1.210", "port": 8096, "health": "http://192.168.1.210:8096/health", "every": 60, "open": "http://192.168.1.210:8096/"},
+    {"name": "Jellyseerr", "group": "Media", "side": "server", "host": "192.168.1.210", "port": 5055, "health": "http://192.168.1.210:5055/api/v1/status", "every": 120, "open": "http://192.168.1.210:5055/"},
+    {"name": "Sonarr", "group": "Media", "side": "server", "host": "192.168.1.210", "port": 8989, "health": "http://192.168.1.210:8989/ping", "every": 120, "open": "http://192.168.1.210:8989/"},
+    {"name": "Radarr", "group": "Media", "side": "server", "host": "192.168.1.210", "port": 7878, "health": "http://192.168.1.210:7878/ping", "every": 120, "open": "http://192.168.1.210:7878/"},
+    {"name": "Prowlarr", "group": "Media", "side": "server", "host": "192.168.1.210", "port": 9696, "health": "http://192.168.1.210:9696/ping", "every": 120, "open": "http://192.168.1.210:9696/"},
+    {"name": "qBittorrent", "group": "Media", "side": "server", "host": "192.168.1.210", "port": 8080, "open": "http://192.168.1.210:8080/"},
+    {"name": "Plex (.201)", "group": "Media", "side": "server", "host": "192.168.1.201", "port": 32400, "health": "http://192.168.1.201:32400/identity", "every": 60, "open": "http://192.168.1.201:32400/web"}
+  ]
+}

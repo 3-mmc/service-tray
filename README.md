@@ -9,6 +9,9 @@ in [Xojo](https://xojo.com); a sibling of [LlamaTray](https://github.com/3-mmc/l
   <img src="docs/details.png" alt="The details window: status, port, side and owning process for every service" width="560">
 </p>
 
+**Linux:** [`linux/`](linux/) holds a Linux edition (Python + GTK3, no Xojo needed); see
+[Linux edition](#linux-edition) below. Everything else in this README describes the Windows build.
+
 The real thing, on the machine it was written for: 22 services across Windows and a WSL
 Debian (media stack, local AI gateway, self-hosted apps in Docker, MCP backends), with
 the menu on the left and *Details...* on the right.
@@ -145,6 +148,44 @@ tools/xojo-ide build 'D:\Projekte\service-tray\ServiceTray.xojo_project'
 ```
 
 Quit the running ServiceTray before rebuilding; the exe is locked while it runs.
+
+## Linux edition
+
+`linux/service-tray` is a single Python 3 script on GTK3 (`python-gobject`, `python-cairo`;
+`ss` from iproute2). It keeps the menu, the details and preferences windows, the
+ephemeral / other listeners / reserved ports sections, move detection with *Use :port* and
+*Change port...*, the llama-swap model menu over `/api/events`, the VRAM bar, server
+machines, and `status.txt`. The Windows-only parts (WSL probe, Winsock/netsh port verdicts)
+are gone.
+
+```sh
+linux/install.sh          # ~/.local/bin/service-tray, XFCE autostart entry, seeds the config
+service-tray &            # or log out and in
+```
+
+Config, settings and `status.txt` live in `~/.config/service-tray/`; the starting config is
+`linux/services.example.json`. Differences from the Windows `services.json`:
+
+| Key | Linux meaning |
+|---|---|
+| `side` | omit for this machine; `server` (+ `host`) for another machine |
+| `unit` | a systemd unit: `llama-swap.service` (user) or `system:sshd.service`. Inactive = down, failed shows as such, activating = degraded |
+| `docker` | container name, read from `docker ps -a` (published ports count as listening even under NAT-only Docker) |
+| `restart` | a shell command; without one, a `unit` restarts with `systemctl [--user] restart` (system units through `pkexec`) and a `docker` service with `docker restart` |
+| `process` | a process name as `ss -p` shows it (`llama-swap`, `python3`) |
+
+Top-level: `localEvery` (5 s), `dockerEvery` (15 s), `healthEvery`, `serverEvery`,
+`ignorePorts`, `ignoreFrom` (default: the start of the kernel's ephemeral range, 32768),
+`checkPorts`, `llamaSwap`, `servers`, `serverTitle`, `localTitle` (default: the hostname).
+
+Clicking (left or right) opens the menu; **middle-click** refreshes, because a menu that opens on
+the first click leaves no room for a double-click. There is no check-mark gutter, so the status dot
+sits at the menu's edge. Unprivileged `ss -p` cannot name root's sockets (sshd, docker-proxy,
+tailscaled); they show as *root process*, and Docker ports are named after their container. *Check
+ports...* (under *Tools*) tries a real bind on every quiet port; on Linux it mostly finds ports
+something outside `ss`'s view holds, or privileged ports.
+
+Flags: `--details`, `--prefs`, `--check-ports`, `--menu` (pops the menu after 6 s), `--quit-after N`.
 
 ## Licence
 

@@ -1,0 +1,1580 @@
+#!/usr/bin/env python3
+"""ServiceTray for Linux: a tray monitor for local services, Docker containers, systemd units
+and services on other machines. A port of the Windows/Xojo ServiceTray; same services.json
+format, minus the WSL side.
+
+  service-tray                 run in the tray
+  service-tray --details       also open the details window
+  service-tray --prefs         also open Preferences
+  service-tray --check-ports   run the port check after 8 s (results in status.txt)
+  service-tray --menu          pop the menu up after 6 s (for screenshots)
+  service-tray --quit-after N  quit after N seconds (tests)
+
+Config: ~/.config/service-tray/services.json (see services.example.json next to this file).
+"""
+import datetime
+import errno
+import fcntl
+import http.client
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+
+import cairo  # noqa: E402
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)  # Gtk.StatusIcon
+
+APP = "ServiceTray"
+CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "service-tray")
+CONFIG = os.path.join(CONF_DIR, "services.json")
+SETTINGS = os.path.join(CONF_DIR, "settings.json")
+STATUS = os.path.join(CONF_DIR, "status.txt")
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+UNKNOWN, UP, IDLE, DEGRADED, DOWN, EPHEMERAL = "unknown", "up", "idle", "degraded", "down", "new"
+SEVERITY = {DOWN: 3, DEGRADED: 2, UNKNOWN: 1}
+COLORS = {UP: "#27AE60", DEGRADED: "#E67E22", DOWN: "#C0392B", EPHEMERAL: "#2E86DE",
+          IDLE: "#7F8C8D", UNKNOWN: "#7F8C8D"}
+
+DEFAULT_CONFIG = {"localEvery": 5, "dockerEvery": 15, "healthEvery": 30, "services": []}
+
+
+def ephemeral_floor():
+    """The kernel's ephemeral range starts here; listeners above it are client noise."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 32768
+
+
+def owner_key(who):
+    """"Sonarr.exe", "sonarr" and "Son arr" compare equal."""
+    k = who.lower().replace(" ", "")
+    return k[:-4] if k.endswith(".exe") else k
+
+
+def owner_matches(who, process):
+    """`who` may list several owners ("a, b"); `process` may name alternatives ("codex|opencode")."""
+    alts = {owner_key(a.strip()) for a in process.split("|") if a.strip()}
+    return any(owner_key(part.strip()) in alts for part in who.split(","))
+
+
+def rgb(hexcolor):
+    h = hexcolor.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def to_pixbuf(surface, size):
+    return Gdk.pixbuf_get_from_surface(surface, 0, 0, size, size)
+
+
+def object_bounds(body, pos):
+    """[a, b) of the innermost JSON object around character pos, skipping strings."""
+    stack, depth, in_str, esc, a = [], -1, False, False, -1
+    for i, c in enumerate(body):
+        if i == pos:
+            if not stack:
+                return None
+            depth, a = len(stack), stack[-1]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            if len(stack) == depth:
+                return a, i + 1
+            stack.pop()
+    return None
+
+
+def run(cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, "", str(e)
+
+
+# ---------------------------------------------------------------- probes (worker threads)
+
+def probe_listeners():
+    """{port: {"owners": [names], "addrs": [bind addresses]}} from ss. Unprivileged ss -p names
+    only our own processes; root's (sshd, docker-proxy, tailscaled) come back without one."""
+    code, out, err = run(["ss", "-ltnpH"], 5)
+    if code != 0:
+        raise RuntimeError(err.strip() or "ss failed")
+    ports = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) < 4 or ":" not in f[3]:
+            continue
+        addr, _, port = f[3].rpartition(":")
+        try:
+            port = int(port)
+        except ValueError:
+            continue
+        e = ports.setdefault(port, {"owners": [], "addrs": []})
+        addr = addr.strip("[]").split("%")[0]
+        if addr not in e["addrs"]:
+            e["addrs"].append(addr)
+        for name in re.findall(r'\("([^"]+)",pid=\d+', line):
+            if name not in e["owners"]:
+                e["owners"].append(name)
+    return ports
+
+
+def probe_docker():
+    """({container: status}, {host port: container}) or raises with the reason."""
+    if not shutil.which("docker"):
+        raise RuntimeError("docker not installed")
+    code, out, err = run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"], 15)
+    if code != 0:
+        msg = err.strip().splitlines()[-1] if err.strip() else "docker ps failed"
+        raise RuntimeError("docker: " + msg[:80])
+    containers, ports = {}, {}
+    for line in out.splitlines():
+        name, status, published = (line.split("\t") + ["", ""])[:3]
+        containers[name] = status
+        for p in re.findall(r":(\d+)->\d+/tcp", published):
+            ports[int(p)] = name
+    return containers, ports
+
+
+def probe_units(units):
+    """{unit spec: (LoadState, ActiveState, SubState)}; "system:x" specs are system units."""
+    result = {}
+    for scope in ("user", "system"):
+        specs = [u for u in units if u.startswith("system:") == (scope == "system")]
+        if not specs:
+            continue
+        names = [u.split(":", 1)[1] if scope == "system" else u for u in specs]
+        cmd = ["systemctl"] + (["--user"] if scope == "user" else []) + \
+              ["show", "-p", "LoadState", "-p", "ActiveState", "-p", "SubState", "--"] + names
+        code, out, _ = run(cmd, 5)
+        blocks = out.strip("\n").split("\n\n")
+        for spec, block in zip(specs, blocks):
+            d = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+            result[spec] = (d.get("LoadState", ""), d.get("ActiveState", ""), d.get("SubState", ""))
+    return result
+
+
+_insecure = ssl.create_default_context()
+_insecure.check_hostname = False
+_insecure.verify_mode = ssl.CERT_NONE  # Proxmox and friends use self-signed certs
+
+
+def probe_health(url):
+    """(HTTP status, message); status 0 = no HTTP answer."""
+    req = urllib.request.Request(url, headers={"Accept-Encoding": "identity", "User-Agent": "ServiceTray"})
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=_insecure) as r:
+            return r.status, ""
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        reason = getattr(e, "reason", e)
+        return 0, str(reason)[:80]
+
+
+def probe_connect(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=8):
+            return True
+    except OSError:
+        return False
+
+
+def probe_vram():
+    code, out, _ = run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                        "--format=csv,noheader,nounits"], 10)
+    parts = out.strip().splitlines()[0].split(",") if code == 0 and out.strip() else []
+    if len(parts) >= 2 and int(parts[1]) > 0:
+        return int(parts[0]), int(parts[1])
+    return None
+
+
+def bind_verdict(port):
+    """None if the port binds, else why not."""
+    for fam, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if fam == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s.bind((addr, port))
+        except OSError as e:
+            if e.errno == errno.EADDRNOTAVAIL:
+                continue  # no IPv6
+            if e.errno == errno.EACCES:
+                return "privileged (below net.ipv4.ip_unprivileged_port_start)"
+            return f"unbindable on {addr}: {os.strerror(e.errno)}"
+        finally:
+            s.close()
+    return None
+
+
+# ---------------------------------------------------------------- the app
+
+class Tray:
+    def __init__(self, args):
+        self.args = args
+        self.pool = ThreadPoolExecutor(max_workers=8)
+        self.quitting = False
+        self.seconds = 0
+        self.config_error = ""
+        self.config_stamp = None
+        self.cfg, self.services = {}, []
+        self.ports, self.local_known, self.local_baselined = {}, False, False
+        self.containers, self.docker_ports, self.docker_known, self.docker_error = {}, {}, False, ""
+        self.units = {}
+        self.health, self.health_due = {}, {}
+        self.remote, self.remote_due = {}, 0
+        self.seen = {}               # port -> datetime it appeared, None = already there at start
+        self.learned_owner = {}
+        self.port_verdict, self.port_check_time, self.port_check_count = {}, None, 0
+        self.auto_checked = {}
+        self.models, self.model_names, self.running = [], {}, {}
+        self.llama_up, self.events_alive, self.events_started, self.llama_polling = False, False, 0, False
+        self.vram, self.gpu_due = None, 0
+        self.busy = set()           # probes in flight
+        self.dirty = True
+        self.last_status, self.last_key, self.summary = "", "", ""
+        self.details = self.prefs = None
+        self.menu = None
+        self.dots = {}
+        self.icon_size = 22
+        self.load_config()
+        self.load_settings()
+
+        self.icon = Gtk.StatusIcon()
+        self.icon.set_title(APP)
+        self.icon.set_name("service-tray")
+        self.icon.connect("activate", lambda i: self.show_menu(1, Gtk.get_current_event_time()))
+        self.icon.connect("popup-menu", lambda i, b, t: self.show_menu(b, t))
+        self.icon.connect("button-press-event", self.on_button)
+        self.icon.connect("size-changed", self.on_size)
+        self.icon.set_from_pixbuf(self.make_icon(COLORS[UNKNOWN]))
+        self.icon.set_tooltip_text(f"{APP}: starting")
+        self.icon.set_visible(True)
+
+        threading.Thread(target=self.events_loop, daemon=True).start()
+        GLib.timeout_add_seconds(1, self.tick)
+        GLib.idle_add(lambda: self.tick() and False)
+        if args.get("details"):
+            GLib.timeout_add_seconds(1, lambda: self.show_details() and False)
+        if args.get("prefs"):
+            GLib.timeout_add_seconds(1, lambda: self.show_prefs() and False)
+        if args.get("check-ports"):
+            GLib.timeout_add_seconds(8, lambda: self.check_ports(False) and False)
+        if args.get("menu"):
+            GLib.timeout_add_seconds(6, lambda: self.show_menu(1, Gtk.get_current_event_time()) and False)
+        if args.get("quit-after"):
+            GLib.timeout_add_seconds(int(args["quit-after"]), self.quit)
+
+    # ------------------------------------------------------------ config
+
+    def load_config(self):
+        os.makedirs(CONF_DIR, exist_ok=True)
+        if not os.path.exists(CONFIG):
+            with open(CONFIG, "w") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2)
+        try:
+            self.config_stamp = os.stat(CONFIG).st_mtime
+            with open(CONFIG) as f:
+                cfg = json.load(f)
+            services = [s for s in cfg.get("services", []) if isinstance(s, dict) and s.get("name")]
+            self.config_error = ""
+        except (OSError, ValueError) as e:
+            self.config_error = f"services.json: {e}"[:200]
+            return
+        self.cfg, self.services = cfg, services
+        self.local_every = max(1, int(cfg.get("localEvery", 5)))
+        self.docker_every = max(1, int(cfg.get("dockerEvery", 15)))
+        self.health_every = max(1, int(cfg.get("healthEvery", 30)))
+        self.server_every = max(5, int(cfg.get("serverEvery", 30)))
+        self.ignore_from = int(cfg.get("ignoreFrom", ephemeral_floor()))
+        self.ignore_ports = {int(p) for p in cfg.get("ignorePorts", [])}
+        self.servers = cfg.get("servers", {})
+        self.server_title = cfg.get("serverTitle", "Server")
+        self.local_title = cfg.get("localTitle") or socket.gethostname()
+        ls = cfg.get("llamaSwap") or {}
+        self.llama_url = ls.get("url", "").rstrip("/")
+        self.llama_name = ls.get("service", "")
+        self.uses_docker = any(s.get("docker") for s in services)
+
+    def reload_config(self):
+        self.load_config()
+        self.health, self.health_due, self.last_key, self.last_status = {}, {}, "", ""
+        for port in [p for p in self.seen if self.is_listed(p)]:
+            del self.seen[port]  # a port a service now claims is no longer an unlisted listener
+        self.refresh_now()
+
+    def load_settings(self):
+        d = {}
+        try:
+            with open(SETTINGS) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            pass
+        self.apply_settings(d, save=False)
+
+    def apply_settings(self, d, save=True):
+        self.sort_by = d.get("sortBy") or "environment"
+        self.show_categories = bool(d.get("showCategories", True))
+        self.collapse_healthy = bool(d.get("collapseHealthy", self.cfg.get("collapseHealthy", False)))
+        self.hide_idle = bool(d.get("hideIdle", False))
+        self.port_from = int(d.get("portFrom", 0) or 0)
+        self.port_to = int(d.get("portTo", 0) or 0)
+        if save:
+            try:
+                with open(SETTINGS, "w") as f:
+                    json.dump(self.settings(), f, indent=4)
+            except OSError:
+                pass
+            self.last_status = ""
+            self.refresh()
+
+    def settings(self):
+        return {"sortBy": self.sort_by, "showCategories": self.show_categories,
+                "collapseHealthy": self.collapse_healthy, "hideIdle": self.hide_idle,
+                "portFrom": self.port_from, "portTo": self.port_to}
+
+    # ------------------------------------------------------------ helpers
+
+    def is_server(self, s):
+        return s.get("side") == "server"
+
+    def is_reserved(self, s):
+        return bool(s.get("reserved"))
+
+    def is_ignored(self, port):
+        return port in self.ignore_ports or (self.ignore_from > 0 and port >= self.ignore_from)
+
+    def is_listed(self, port):
+        return any(int(s.get("port", 0) or 0) == port and not self.is_server(s) for s in self.services)
+
+    def llama_service(self):
+        return next((s for s in self.services if s.get("name") == self.llama_name), None)
+
+    def host_name(self, s):
+        return self.servers.get(s.get("host", ""), s.get("host", ""))
+
+    def host_label(self, s):
+        h, n = s.get("host", ""), self.host_name(s)
+        return f"{n} ({h})" if n != h else h
+
+    def env_name(self, s):
+        return self.host_name(s) if self.is_server(s) else ("docker" if s.get("docker") else "local")
+
+    def group_of(self, s):
+        return s.get("group") or self.env_name(s)
+
+    def groups(self):
+        out = []
+        for s in self.services:
+            if self.group_of(s) not in out:
+                out.append(self.group_of(s))
+        return out
+
+    def key_of(self, s):
+        return f"svc:{self.services.index(s)}"
+
+    def service_by_key(self, key):
+        if not key.startswith("svc:"):
+            return None
+        i = int(key[4:])
+        return self.services[i] if 0 <= i < len(self.services) else None
+
+    def model_label(self, mid):
+        name = self.model_names.get(mid, "")
+        return f"{name}  ({mid})" if name and name != mid else mid
+
+    def port_owner(self, port):
+        e = self.ports.get(port)
+        if e and e["owners"]:
+            return ", ".join(e["owners"])
+        if port in self.docker_ports:
+            return "docker " + self.docker_ports[port]
+        return "root process" if e else "?"
+
+    def owner(self, s):
+        if self.is_server(s):
+            return s.get("host", "")
+        ct = s.get("docker", "")
+        if ct and ct in self.containers:
+            return f"docker {ct} ({self.containers[ct]})"
+        port = int(s.get("port", 0) or 0)
+        e = self.ports.get(port)
+        return ", ".join(e["owners"]) if e and e["owners"] else ""
+
+    def seen_text(self, port):
+        t = self.seen.get(port)
+        return "start" if t is None else t.strftime("%H:%M")
+
+    def port_keys(self, ephemeral):
+        return sorted(p for p, t in self.seen.items() if (t is not None) == ephemeral)
+
+    def vram_text(self):
+        used, total = self.vram
+        return f"VRAM {used / 1024:.1f} / {total / 1024:.1f} GB"
+
+    # ------------------------------------------------------------ status
+
+    def listening(self, port):
+        if port in self.ports:
+            return True
+        ct = self.docker_ports.get(port)  # published through NAT only (userland-proxy off)
+        return bool(ct) and self.containers.get(ct, "").startswith("Up")
+
+    def status(self, s):
+        port = int(s.get("port", 0) or 0)
+        reserved = self.is_reserved(s)
+        optional = reserved or bool(s.get("optional"))
+        soft = IDLE if optional else DOWN
+        if self.is_server(s):
+            if port:
+                addr = f"{s.get('host')}:{port}"
+                if addr not in self.remote:
+                    return UNKNOWN, ""
+                if not self.remote[addr]:
+                    return soft, f"no answer from {addr}"
+            listening = True
+        else:
+            if not self.local_known:
+                return UNKNOWN, ""
+            unit = s.get("unit", "")
+            if unit:
+                if unit not in self.units:
+                    return UNKNOWN, ""
+                load, active, sub = self.units[unit]
+                if load == "not-found":
+                    return soft, "unit not found"
+                if active in ("activating", "reloading", "deactivating"):
+                    return DEGRADED, f"unit {active}"
+                if active != "active":
+                    return soft, f"unit {active}" + (f" ({sub})" if sub and sub not in ("dead", active) else "")
+            ct = s.get("docker", "")
+            if ct:
+                if self.docker_error:
+                    return soft, self.docker_error
+                if not self.docker_known:
+                    return UNKNOWN, ""
+                if ct not in self.containers:
+                    return soft, "no container"
+                st = self.containers[ct]
+                if not st.startswith("Up"):
+                    return soft, st
+                if "(unhealthy)" in st:
+                    return DEGRADED, "unhealthy"
+                if "(health: starting)" in st:
+                    return DEGRADED, "starting"
+            listening = port == 0 or self.listening(port)
+
+        if not listening:
+            # Its own process on a port nobody configured: the service moved and services.json
+            # did not follow. Running, so degraded rather than down.
+            moved = 0 if reserved else self.moved_to(s)
+            if moved:
+                return DEGRADED, f"{self.port_owner(moved)} is listening on :{moved} instead"
+            detail = "free (reserved)" if reserved else ("not running" if optional else "not listening")
+            if port in self.port_verdict:
+                detail += ": port " + self.port_verdict[port]
+            return soft, detail
+
+        detail = ""
+        if s.get("process") and not s.get("docker"):
+            who = self.owner(s)
+            if who and not owner_matches(who, s["process"]):
+                return DEGRADED, f"taken by {who}"
+        if reserved:
+            detail = "in use"
+        if s is self.llama_service():
+            for mid, st in self.running.items():
+                if st != "ready":
+                    detail = f"{mid} {st}"
+        if s.get("health"):
+            if s["name"] not in self.health:
+                return UP, detail
+            code, msg = self.health[s["name"]]
+            if code == 0:
+                return DEGRADED, "no HTTP answer" + (f": {msg}" if msg else "")
+            if code >= 500:
+                return DEGRADED, f"HTTP {code}"
+        return UP, detail
+
+    def moved_to(self, s):
+        """The lowest unlisted port held by this service's own process (or container) while its
+        configured port is quiet, else 0."""
+        port = int(s.get("port", 0) or 0)
+        if not port or self.is_server(s) or not self.local_known or self.listening(port):
+            return 0
+        want = [owner_key(a) for a in s.get("process", "").split("|") if a.strip()]
+        learned = self.learned_owner.get(s["name"])
+        if learned and not any(k != s["name"] and v == learned for k, v in self.learned_owner.items()):
+            want.append(owner_key(learned))  # a generic owner shared with another service proves nothing
+        want.append(owner_key(s["name"]))
+        ct = s.get("docker", "")
+        for p in sorted(set(self.ports) | set(self.docker_ports)):
+            if p == port or self.is_ignored(p) or self.is_listed(p):
+                continue
+            if ct and self.docker_ports.get(p) == ct:
+                return p
+            owners = self.ports.get(p, {}).get("owners", [])
+            if any(owner_key(o) in want for o in owners):
+                return p
+        return 0
+
+    def rollup(self, members):
+        worst, ok = UP, 0
+        for s in members:
+            st, _ = self.status(s)
+            if st in (UP, IDLE):
+                ok += 1
+            if SEVERITY.get(st, 0) > SEVERITY.get(worst, 0):
+                worst = st
+        return worst, ok, len(members)
+
+    def layout(self):
+        """("head", title, members) / ("sub", label) / ("svc", service), per the Preferences sort."""
+        shown = []
+        for s in self.services:
+            if self.is_reserved(s):
+                continue
+            port = int(s.get("port", 0) or 0)
+            if self.port_from and port and port < self.port_from:
+                continue
+            if self.port_to and port > self.port_to:
+                continue
+            if self.hide_idle and self.status(s)[0] == IDLE:
+                continue
+            shown.append(s)
+        out = []
+        if self.sort_by == "category":
+            for g in self.groups():
+                self.add_section(out, g, [s for s in shown if self.group_of(s) == g], False)
+        elif self.sort_by in ("port", "name"):
+            if self.sort_by == "port":
+                members = sorted(shown, key=lambda s: (int(s.get("port", 0) or 0) or 99999, s["name"]))
+            else:
+                members = sorted(shown, key=lambda s: s["name"].lower())
+            self.add_section(out, "By port" if self.sort_by == "port" else "By name", members, False)
+        else:
+            self.add_section(out, self.local_title, [s for s in shown if not self.is_server(s)],
+                             self.show_categories)
+            self.add_section(out, self.server_title, [s for s in shown if self.is_server(s)], True, True)
+        return out
+
+    def add_section(self, out, title, members, with_categories, by_host=False):
+        if not members:
+            return
+        out.append(("head", title, members))
+        if not with_categories:
+            out.extend(("svc", s) for s in members)
+            return
+        label = self.host_label if by_host else (lambda s: s.get("group", ""))
+        cats = []
+        for s in members:
+            if label(s) not in cats:
+                cats.append(label(s))
+        for c in cats:
+            if c:
+                out.append(("sub", c))
+            out.extend(("svc", s) for s in members if label(s) == c)
+
+    # ------------------------------------------------------------ the clock
+
+    def submit(self, name, fn, done, *args):
+        """Run fn(*args) on a worker; done(result or exception) back on the GTK thread."""
+        if name in self.busy:
+            return
+        self.busy.add(name)
+
+        def work():
+            try:
+                res = fn(*args)
+            except Exception as e:  # noqa: BLE001 - reported as the probe's result
+                res = e
+            GLib.idle_add(finish, res)
+
+        def finish(res):
+            self.busy.discard(name)
+            if not self.quitting:
+                done(res)
+            return False
+
+        self.pool.submit(work)
+
+    def tick(self):
+        if self.quitting:
+            return False
+        sec = self.seconds
+        self.seconds += 1
+
+        if sec % self.local_every == 0:
+            self.submit("ss", probe_listeners, self.got_listeners)
+            units = sorted({s["unit"] for s in self.services if s.get("unit") and not self.is_server(s)})
+            if units:
+                self.submit("units", probe_units, self.got_units, units)
+            try:
+                if os.stat(CONFIG).st_mtime != self.config_stamp:
+                    GLib.idle_add(lambda: self.reload_config() and False)
+            except OSError:
+                pass
+        docker_every = min(self.docker_every, 5) if self.details else self.docker_every
+        if self.uses_docker and sec % docker_every == 0:
+            self.submit("docker", probe_docker, self.got_docker)
+
+        # llama-swap pushes model changes over /api/events; if the stream never delivers, poll.
+        if self.llama_url and not self.events_alive and self.events_started and \
+                time.monotonic() - self.events_started > 10 and self.listening_url(self.llama_url):
+            self.llama_polling = True
+        if self.llama_url and self.llama_polling and sec % 3 == 0:
+            self.submit("llama-poll", self.poll_running, self.got_running)
+
+        if sec >= self.gpu_due and shutil.which("nvidia-smi"):
+            self.gpu_due = sec + (5 if self.running else 30)
+            self.submit("gpu", probe_vram, self.got_vram)
+
+        if sec >= self.remote_due:
+            self.remote_due = sec + self.server_every
+            for s in self.services:
+                port = int(s.get("port", 0) or 0)
+                if self.is_server(s) and port and s.get("host"):
+                    addr = f"{s['host']}:{port}"
+                    self.submit("tcp " + addr, probe_connect, lambda ok, a=addr: self.got_remote(a, ok),
+                                s["host"], port)
+
+        for s in self.services:
+            name = s["name"]
+            if not s.get("health") or sec < self.health_due.get(name, 0):
+                continue
+            st, _ = self.status(s)
+            if st == UNKNOWN:
+                continue
+            self.health_due[name] = sec + int(s.get("every", self.health_every))
+            if st in (DOWN, IDLE) or self.moved_to(s):
+                self.health.pop(name, None)
+            else:
+                self.submit("health " + name, probe_health, lambda r, n=name: self.got_health(n, r), s["health"])
+
+        if self.dirty:
+            self.refresh()
+        return True
+
+    def listening_url(self, url):
+        port = urllib.parse.urlsplit(url).port or 80
+        return port in self.ports
+
+    def refresh_now(self):
+        self.health_due, self.remote_due, self.gpu_due, self.seconds = {}, 0, 0, 0
+        self.tick()
+
+    # ------------------------------------------------------------ probe results
+
+    def got_listeners(self, res):
+        if isinstance(res, Exception):
+            self.config_error = self.config_error or f"ss: {res}"
+            return
+        self.ports, self.local_known = res, True
+        # Unlisted ports: the first look is the baseline (None = already there); later ones are new.
+        for port in res:
+            if self.is_ignored(port) or self.is_listed(port) or port in self.seen:
+                continue
+            self.seen[port] = datetime.datetime.now() if self.local_baselined else None
+        for port in [p for p in self.seen if p not in res]:
+            del self.seen[port]
+        self.local_baselined = True
+        self.dirty = True
+        # A required local service whose port went quiet: can the port be bound at all? (5 min)
+        for s in self.services:
+            port = int(s.get("port", 0) or 0)
+            if self.is_server(s) or port < 1024 or s.get("optional") or self.is_reserved(s):
+                continue
+            if self.status(s)[0] == DOWN and self.seconds >= self.auto_checked.get(s["name"], 0):
+                self.auto_checked[s["name"]] = self.seconds + 300
+                v = bind_verdict(port)
+                if v:
+                    self.port_verdict[port] = v
+                else:
+                    self.port_verdict.pop(port, None)
+
+    def got_units(self, res):
+        if not isinstance(res, Exception):
+            self.units = res
+            self.dirty = True
+
+    def got_docker(self, res):
+        if isinstance(res, Exception):
+            self.docker_error, self.containers, self.docker_ports = str(res), {}, {}
+        else:
+            self.docker_error = ""
+            self.containers, self.docker_ports = res
+        self.docker_known = True
+        self.dirty = True
+
+    def got_health(self, name, res):
+        if not isinstance(res, Exception):
+            self.health[name] = res
+            self.dirty = True
+
+    def got_remote(self, addr, ok):
+        self.remote[addr] = ok is True
+        self.dirty = True
+
+    def got_vram(self, res):
+        if res and not isinstance(res, Exception):
+            self.vram = res
+            self.dirty = True
+
+    # ------------------------------------------------------------ llama-swap
+
+    def events_loop(self):
+        """One long-lived GET /api/events; the first message is the full model list, and it
+        repeats on every change. Reconnects 5 s after the gateway goes away."""
+        while not self.quitting:
+            if not self.llama_url:
+                time.sleep(5)
+                continue
+            u = urllib.parse.urlsplit(self.llama_url)
+            self.events_started = time.monotonic()
+            try:
+                cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+                conn = cls(u.hostname, u.port, timeout=None)
+                conn.request("GET", "/api/events", headers={"Accept": "text/event-stream"})
+                r = conn.getresponse()
+                if r.status != 200:
+                    raise OSError(f"HTTP {r.status}")
+                while not self.quitting:
+                    raw = r.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line.startswith("data:"):
+                        GLib.idle_add(self.handle_event, line[5:].strip())
+                conn.close()
+            except (OSError, http.client.HTTPException):
+                pass
+            GLib.idle_add(self.llama_gone)
+            time.sleep(5)
+
+    def handle_event(self, payload):
+        try:
+            ev = json.loads(payload)
+            if ev.get("type") != "modelStatus":
+                return False
+            arr = json.loads(ev.get("data", "[]"))
+        except (ValueError, AttributeError):
+            return False
+        running, ids, names = {}, [], {}
+        for m in arr:
+            st = m.get("state", "")
+            if st not in ("stopped", "shutdown", ""):
+                running[m["id"]] = st
+            if m.get("unlisted"):
+                continue
+            ids.append(m["id"])
+            names[m["id"]] = m.get("name") or m["id"]
+        if len(running) != len(self.running):
+            self.gpu_due = 0  # a model that starts or stops changes VRAM
+        self.models, self.model_names, self.running = ids, names, running
+        self.llama_up = self.events_alive = True
+        self.llama_polling = False
+        self.dirty = True
+        return False
+
+    def llama_gone(self):
+        if not self.llama_polling:
+            self.llama_up, self.running, self.events_alive = False, {}, False
+            self.dirty = True
+        return False
+
+    def poll_running(self):
+        with urllib.request.urlopen(self.llama_url + "/running", timeout=3) as r:
+            running = {m["model"]: m["state"] for m in json.load(r).get("running", [])}
+        models = self.models
+        if not models:
+            with urllib.request.urlopen(self.llama_url + "/v1/models", timeout=5) as r:
+                data = json.load(r).get("data", [])
+            models = [(m["id"], m.get("name", m["id"])) for m in data
+                      if m.get("meta", {}).get("llamaswap", {}).get("type", "model") == "model"]
+        return running, models
+
+    def got_running(self, res):
+        if isinstance(res, Exception):
+            self.llama_up, self.running = False, {}
+        else:
+            self.llama_up = True
+            self.running, models = res
+            if models and isinstance(models[0], tuple):
+                self.models = [m for m, _ in models]
+                self.model_names = dict(models)
+        self.dirty = True
+
+    def llama_request(self, method, path, what):
+        def work():
+            req = urllib.request.Request(self.llama_url + path, method=method)
+            with urllib.request.urlopen(req, timeout=600 if what == "load" else 30) as r:
+                return r.status
+
+        def done(res):
+            if isinstance(res, Exception):
+                notify(f"llama-swap {what} failed", str(res))
+            self.refresh_now()
+        self.submit("llama " + path, work, done)
+
+    # ------------------------------------------------------------ view
+
+    def refresh(self):
+        self.dirty = False
+        up = down = degraded = 0
+        bad, lines, worst = [], [], UP
+        for s in self.services:
+            st, detail = self.status(s)
+            if SEVERITY.get(st, 0) > SEVERITY.get(worst, 0):
+                worst = st
+            # Remember which process serves each port while it is up, so a later move to another
+            # port can be recognised (moved_to).
+            if st == UP and int(s.get("port", 0) or 0) and not s.get("docker") and not self.is_server(s):
+                who = self.owner(s)
+                if who:
+                    self.learned_owner[s["name"]] = who
+            side = s.get("host", "") if self.is_server(s) else ("docker" if s.get("docker") else "local")
+            lines.append(f"{s['name']}\t{side}\t{int(s.get('port', 0) or 0)}\t{st}\t{detail}")
+            if st == UP:
+                up += 1
+            elif st == DOWN:
+                down += 1
+                bad.append(s["name"])
+            elif st == DEGRADED:
+                degraded += 1
+                bad.append(f"{s['name']} ({detail})")
+
+        if self.config_error:
+            color, tip = COLORS[UNKNOWN], self.config_error
+        else:
+            color = COLORS[{DOWN: DOWN, DEGRADED: DEGRADED, UNKNOWN: UNKNOWN}.get(worst, UP)]
+            tip = f"{up} up"
+            if degraded:
+                tip += f", {degraded} degraded"
+            if down:
+                tip += f", {down} down"
+            eph = len(self.port_keys(True))
+            if eph:
+                tip += f", {eph} ephemeral"
+            if bad:
+                tip += "\n" + ", ".join(bad)
+        if self.running:
+            tip += "\nGPU: " + ", ".join(m + ("" if st == "ready" else f" ({st})") for m, st in self.running.items())
+        if self.vram:
+            tip += "\n" + self.vram_text()
+        self.summary = tip.replace("\n", "   ·   ")
+
+        for p in self.port_keys(True):
+            lines.append(f"(ephemeral)\tlocal\t{p}\tlistening\t{self.port_owner(p)}, since {self.seen_text(p)}")
+        for p in self.port_keys(False):
+            lines.append(f"(unlisted)\tlocal\t{p}\tlistening\t{self.port_owner(p)}")
+        for m, st in self.running.items():
+            lines.append(f"(model) {m}\tgpu\t0\t{st}\t")
+        for p, v in self.port_verdict.items():
+            lines.append(f"(port check)\tlocal\t{p}\tunbindable\t{v}")
+        body = "\n".join(lines)
+        if body != self.last_status:
+            self.last_status = body
+            try:
+                with open(STATUS, "w") as f:
+                    f.write("name\tside\tport\tstatus\tdetail\n" + body + "\n")
+            except OSError:
+                pass
+            if self.details:
+                self.details.reload()
+        if self.details:
+            self.details.set_summary(self.summary)
+
+        key = f"{tip}|{color}|{self.vram}|{self.icon_size}"
+        if key != self.last_key:
+            self.last_key = key
+            self.icon.set_from_pixbuf(self.make_icon(color))
+            self.icon.set_tooltip_text(tip)
+
+    def make_icon(self, color):
+        """A disc in the colour of the worst state; inside it, LlamaTray's white VRAM bar."""
+        n = max(16, self.icon_size)
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, n, n)
+        c = cairo.Context(surf)
+        c.scale(n / 32, n / 32)
+        c.set_source_rgb(*rgb(color))
+        c.arc(16, 16, 15, 0, 6.2832)
+        c.fill()
+        c.set_source_rgb(1, 1, 1)
+        if self.vram:
+            used, total = self.vram
+            h = round(22 * min(1.0, used / total))
+            c.set_line_width(1.5)
+            c.rectangle(12, 5, 8, 22)
+            c.stroke()
+            c.rectangle(12, 27 - h, 8, h)
+            c.fill()
+        else:
+            c.arc(16, 16, 5, 0, 6.2832)
+            c.fill()
+        return to_pixbuf(surf, n)
+
+    def dot(self, st, big=False):
+        key = (st, big)
+        if key not in self.dots:
+            n = 16
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, n, n)
+            c = cairo.Context(surf)
+            c.set_source_rgb(*rgb(COLORS.get(st, COLORS[UNKNOWN])))
+            r = (12 if big else 9) / 2
+            c.arc(n / 2, n / 2, r - (0.75 if st == IDLE else 0), 0, 6.2832)
+            if st == IDLE:  # idle stays hollow, like the old ○
+                c.set_line_width(1.5)
+                c.stroke()
+            else:
+                c.fill()
+            self.dots[key] = to_pixbuf(surf, n)
+        return self.dots[key]
+
+    def on_size(self, icon, size):
+        self.icon_size = size
+        self.last_key = ""
+        self.refresh()
+        return True
+
+    def on_button(self, icon, event):
+        if event.button == 2:  # middle click: refresh now
+            self.refresh_now()
+            return True
+        return False
+
+    # ------------------------------------------------------------ menu
+
+    def item(self, text, st=None, right="", bold=False, big=False, tag=None, sensitive=True, submenu=None):
+        it = Gtk.MenuItem()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        if st is not None:
+            box.pack_start(Gtk.Image.new_from_pixbuf(self.dot(st, big)), False, False, 0)
+        else:
+            box.pack_start(Gtk.Box(width_request=16), False, False, 0)
+        lab = Gtk.Label(xalign=0)
+        if bold:
+            lab.set_markup(f"<b>{GLib.markup_escape_text(text)}</b>")
+        else:
+            lab.set_text(text)
+        box.pack_start(lab, True, True, 0)
+        if right:
+            r = Gtk.Label(label=right, xalign=1)
+            r.get_style_context().add_class("dim-label")
+            box.pack_end(r, False, False, 0)
+        it.add(box)
+        if tag:
+            it.connect("activate", lambda *_: self.do_action(tag))
+        if submenu is not None:
+            it.set_submenu(submenu)
+        it.set_sensitive(sensitive)
+        return it
+
+    @staticmethod
+    def sub_label(text):
+        """A category or host label: small, and without the theme's row padding."""
+        it = Gtk.MenuItem()
+        lab = Gtk.Label(xalign=0, margin_start=22)
+        lab.set_markup(f"<small>{GLib.markup_escape_text(text)}</small>")
+        it.add(lab)
+        it.get_style_context().add_class("sub")
+        it.set_sensitive(False)
+        return it
+
+    @staticmethod
+    def plain(text, tag=None, cb=None, sensitive=True):
+        it = Gtk.MenuItem(label=text)
+        it.set_use_underline(False)
+        if tag is not None:
+            it.connect("activate", lambda *_: cb(tag))
+        it.set_sensitive(sensitive)
+        return it
+
+    def fill_actions(self, key, menu):
+        """Per-row actions, shared by the tray submenus and the details window's context menu."""
+        add = lambda text, tag=None, sensitive=True: menu.append(self.plain(text, tag, self.do_action, sensitive))  # noqa: E731
+        if key.startswith("model:"):
+            add("Unload " + key[6:], "unload:" + key[6:])
+            return
+        if key.startswith("port:"):
+            port = key[5:]
+            add(f"Open http://localhost:{port}/", f"open:http://localhost:{port}/")
+            add("Copy port", "copy:" + port)
+            return
+        s = self.service_by_key(key)
+        if not s:
+            return
+        idx = key[4:]
+        if s is self.llama_service():
+            for mid, st in self.running.items():
+                add(f"Unload {self.model_label(mid)}   [{st}]", "unload:" + mid)
+            if len(self.running) > 1:
+                add("Unload all", "unloadall")
+            load = new_menu()
+            for mid in self.models:
+                if mid not in self.running:
+                    load.append(self.plain(self.model_label(mid), "load:" + mid, self.do_action))
+            li = self.plain("Load", sensitive=self.llama_up and bool(load.get_children()))
+            li.set_submenu(load)
+            menu.append(li)
+            menu.append(Gtk.SeparatorMenuItem())
+        if s.get("open"):
+            add("Open " + s["open"], "open:" + s["open"])
+        if self.restart_command(s):
+            add("Restart gateway..." if s is self.llama_service() else "Restart...", "restart:" + idx)
+        port = int(s.get("port", 0) or 0)
+        if port:
+            add("Copy port", f"copy:{port}")
+        if port and self.is_server(s):
+            add("Copy address", f"copy:{s.get('host')}:{port}")
+        moved = self.moved_to(s)
+        if moved:
+            add(f"Use :{moved} (update services.json)", f"adopt:{idx}:{moved}")
+        add("Change port...", "setport:" + idx)
+        who = self.owner(s)
+        if who:
+            add("Owner: " + who, sensitive=False)
+
+    def build_menu(self):
+        m = new_menu()
+        head = self.config_error or self.summary.split("   ·   ")[0]
+        m.append(self.item(head, sensitive=False))
+        if self.vram:
+            m.append(self.item(self.vram_text(), sensitive=False))
+
+        section, folded = None, False
+        for li in self.layout():
+            if li[0] == "head":
+                worst, ok, total = self.rollup(li[2])
+                m.append(Gtk.SeparatorMenuItem())
+                folded = self.collapse_healthy and ok == total
+                section = new_menu() if folded else None
+                m.append(self.item(li[1].upper(), worst, f"{ok}/{total}", bold=True, big=True, submenu=section))
+                continue
+            target = section if folded else m
+            if li[0] == "sub":
+                target.append(self.sub_label(li[1]))
+                continue
+            s = li[1]
+            st, detail = self.status(s)
+            name = s["name"]
+            if self.sort_by != "environment" and self.is_server(s):
+                name += f"  ({self.host_name(s)})"
+            port = int(s.get("port", 0) or 0)
+            sub = new_menu()
+            self.fill_actions(self.key_of(s), sub)
+            target.append(self.item(name + (f"  -  {detail}" if detail else ""), st,
+                                    f":{port}" if port else "", submenu=sub))
+            if s is self.llama_service():
+                for mid, mst in self.running.items():
+                    target.append(self.item("      " + self.model_label(mid), right=mst, sensitive=False))
+
+        eph = self.port_keys(True)
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(self.item("EPHEMERAL", EPHEMERAL, str(len(eph)) if eph else "none", bold=True, big=True))
+        for p in eph:
+            sub = new_menu()
+            self.fill_actions(f"port:{p}", sub)
+            m.append(self.item(f"{self.port_owner(p)}  -  since {self.seen_text(p)}", EPHEMERAL, f":{p}", submenu=sub))
+        other = self.port_keys(False)
+        om = new_menu()
+        for p in other:
+            sub = new_menu()
+            self.fill_actions(f"port:{p}", sub)
+            om.append(self.item(self.port_owner(p), right=f":{p}", submenu=sub))
+        m.append(self.item("Other listeners", IDLE, str(len(other)), submenu=om, sensitive=bool(other)))
+        res = [s for s in self.services if self.is_reserved(s)]
+        if res:
+            worst, ok, total = self.rollup(res)
+            rm = new_menu()
+            for s in res:
+                st, detail = self.status(s)
+                sub = new_menu()
+                self.fill_actions(self.key_of(s), sub)
+                rm.append(self.item(s["name"] + (f"  -  {detail}" if detail else ""), st,
+                                    f":{s.get('port', 0)}", submenu=sub))
+            m.append(self.item("Reserved ports", IDLE if ok == total else worst,
+                               str(total) if ok == total else f"{total - ok} taken", submenu=rm))
+
+        m.append(Gtk.SeparatorMenuItem())
+        for text, tag in (("Details...", "details"), ("Refresh now", "refresh"), ("Preferences...", "prefs")):
+            m.append(self.plain(text, tag, self.do_action))
+        tools = new_menu()
+        for text, tag in (("Check ports...", "checkports"), ("Edit services.json", "edit"),
+                          ("Reload services.json", "reload")):
+            tools.append(self.plain(text, tag, self.do_action))
+        ti = self.plain("Tools")
+        ti.set_submenu(tools)
+        m.append(ti)
+        m.append(Gtk.SeparatorMenuItem())
+        m.append(self.plain("Quit ServiceTray", "quit", self.do_action))
+        m.show_all()
+        return m
+
+    def show_menu(self, button, when):
+        self.submit("ss", probe_listeners, self.got_listeners)  # fresh ports for next time
+        self.refresh()
+        if self.menu:
+            self.menu.destroy()
+        self.menu = self.build_menu()
+        self.menu.popup(None, None, Gtk.StatusIcon.position_menu, self.icon, button, when)
+        return False
+
+    # ------------------------------------------------------------ actions
+
+    def restart_command(self, s):
+        if s.get("restart"):
+            return s["restart"]
+        unit = s.get("unit", "")
+        if unit.startswith("system:"):
+            return "pkexec systemctl restart " + shlex.quote(unit[7:])
+        if unit:
+            return "systemctl --user restart " + shlex.quote(unit)
+        if s.get("docker"):
+            return "docker restart " + shlex.quote(s["docker"])
+        return ""
+
+    def do_action(self, tag):
+        if tag.startswith("open:"):
+            subprocess.Popen(["xdg-open", tag[5:]], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif tag.startswith("copy:"):
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            cb.set_text(tag[5:], -1)
+            cb.store()
+        elif tag.startswith("restart:"):
+            s = self.service_by_key("svc:" + tag[8:])
+            if s:
+                self.confirm_restart(s)
+        elif tag.startswith("unload:"):
+            self.llama_request("POST", "/api/models/unload/" + urllib.parse.quote(tag[7:], safe=""), "unload")
+        elif tag == "unloadall":
+            self.llama_request("POST", "/api/models/unload", "unload all")
+        elif tag.startswith("load:"):
+            # llama-swap has no load endpoint; any request through /upstream/<model>/ starts it.
+            self.llama_request("GET", "/upstream/" + urllib.parse.quote(tag[5:], safe="") + "/", "load")
+        elif tag == "refresh":
+            self.refresh_now()
+        elif tag == "details":
+            self.show_details()
+        elif tag == "prefs":
+            self.show_prefs()
+        elif tag == "checkports":
+            self.check_ports(True)
+        elif tag == "edit":
+            subprocess.Popen(["xdg-open", CONFIG], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif tag == "reload":
+            self.reload_config()
+        elif tag.startswith("adopt:"):
+            _, idx, port = tag.split(":")
+            s = self.service_by_key("svc:" + idx)
+            if s:
+                self.set_service_port(s, int(port))
+        elif tag.startswith("setport:"):
+            s = self.service_by_key("svc:" + tag[8:])
+            if s:
+                self.ask_port(s)
+        elif tag == "quit":
+            self.quit()
+
+    def confirm_restart(self, s):
+        cmd = self.restart_command(s)
+        text = cmd
+        if s is self.llama_service():
+            text = "This kills every running model, including queued ComfyUI jobs.\n\n" + cmd
+        d = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.NONE,
+                              text=f"Restart {s['name']}?")
+        d.format_secondary_text(text)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Restart", Gtk.ResponseType.OK)
+        d.set_keep_above(True)
+        ok = d.run() == Gtk.ResponseType.OK
+        d.destroy()
+        if not ok:
+            return
+
+        def work():
+            return run(["sh", "-c", cmd], 300)
+
+        def done(res):
+            if isinstance(res, Exception) or res[0] != 0:
+                msg = str(res) if isinstance(res, Exception) else (res[2] or res[1]).strip()[-300:]
+                notify(f"Restart {s['name']} failed", msg or "exit code " + str(res[0]))
+            self.refresh_now()
+        self.submit("restart " + s["name"], work, done)
+
+    def ask_port(self, s):
+        d = Gtk.Dialog(title=f"Change port - {s['name']}", flags=Gtk.DialogFlags.MODAL)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Change", Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        moved = self.moved_to(s)
+        box.add(Gtk.Label(label=f"New port for {s['name']} (now :{s.get('port', 0)})"
+                          + (f"\nIts process is listening on :{moved}." if moved else ""), xalign=0))
+        spin = Gtk.SpinButton.new_with_range(1, 65535, 1)
+        spin.set_value(moved or int(s.get("port", 0) or 0) or 8000)
+        spin.set_activates_default(True)
+        box.add(spin)
+        d.show_all()
+        ok = d.run() == Gtk.ResponseType.OK
+        port = spin.get_value_as_int()
+        d.destroy()
+        if ok and port != int(s.get("port", 0) or 0):
+            self.set_service_port(s, port)
+
+    def set_service_port(self, s, new_port):
+        """Rewrite only this service's object in services.json, as text, so the hand formatting
+        survives: its "port" and every ":<old>" in its URLs follow. Keeps services.json.bak."""
+        if not 0 < new_port <= 65535:
+            return
+        old = int(s.get("port", 0) or 0)
+        problem = ""
+        try:
+            with open(CONFIG) as f:
+                body = f.read()
+            m = re.search(r'"name"\s*:\s*' + re.escape(json.dumps(s["name"])), body)
+            bounds = object_bounds(body, m.start()) if m else None
+            if not m:
+                problem = "its entry was not found"
+            elif not bounds:
+                problem = "its entry could not be delimited"
+            else:
+                a, b = bounds
+                obj = body[a:b]
+                if old:
+                    obj = re.sub(r'"port"\s*:\s*%d\b' % old, f'"port": {new_port}', obj)
+                    obj = re.sub(r":%d(?=[/\"])" % old, f":{new_port}", obj)
+                else:
+                    obj = obj.replace(m.group(0), m.group(0) + f', "port": {new_port}', 1)
+                with open(CONFIG + ".bak", "w") as f:
+                    f.write(body)
+                with open(CONFIG, "w") as f:
+                    f.write(body[:a] + obj + body[b:])
+        except OSError as e:
+            problem = str(e)
+        if problem:
+            message(f"Could not change the port of {s['name']}: {problem}.\nUse Edit services.json instead.")
+            return
+        self.reload_config()
+
+    def check_ports(self, interactive):
+        """Every configured local port nobody is listening on, plus checkPorts: try a real bind."""
+        ports = set()
+        for s in self.services:
+            p = int(s.get("port", 0) or 0)
+            if p and not self.is_server(s) and not self.listening(p):
+                ports.add(p)
+        for spec in self.cfg.get("checkPorts", []):
+            if isinstance(spec, str) and "-" in spec:
+                a, b = (int(x) for x in spec.split("-", 1))
+                ports.update(range(a, b + 1))
+            else:
+                ports.add(int(spec))
+        ports = {p for p in ports if not self.listening(p)}
+        self.port_verdict = {}
+        for p in sorted(ports):
+            v = bind_verdict(p)
+            if v:
+                self.port_verdict[p] = v
+        self.port_check_time, self.port_check_count = datetime.datetime.now(), len(ports)
+        self.last_status = ""
+        self.refresh()
+        if interactive:
+            if self.port_verdict:
+                lines = "\n".join(f":{p}  {v}" for p, v in sorted(self.port_verdict.items()))
+                message(f"{len(self.port_verdict)} of {len(ports)} quiet ports cannot be bound:\n\n{lines}")
+            else:
+                message(f"All {len(ports)} quiet ports bind fine.")
+        return False
+
+    def show_details(self):
+        if not self.details:
+            self.details = DetailsWindow(self)
+        self.details.reload()
+        self.details.set_summary(self.summary)
+        self.details.present()
+        return False
+
+    def show_prefs(self):
+        if not self.prefs:
+            self.prefs = PrefsWindow(self)
+        self.prefs.present()
+        return False
+
+    def quit(self, *_):
+        self.quitting = True
+        Gtk.main_quit()
+        return False
+
+    # ------------------------------------------------------------ details rows
+
+    def detail_rows(self):
+        """(kind, status, key, [name, status, port, where, owner, detail]) in menu order."""
+        rows = []
+        for li in self.layout():
+            if li[0] == "head":
+                worst, ok, total = self.rollup(li[2])
+                rows.append(("group", worst, "", [li[1], f"{ok}/{total} ok", "", "", "", ""]))
+            elif li[0] == "sub":
+                rows.append(("sub", None, "", ["  " + li[1], "", "", "", "", ""]))
+            else:
+                s = li[1]
+                st, detail = self.status(s)
+                port = int(s.get("port", 0) or 0)
+                rows.append(("service", st, self.key_of(s), ["    " + s["name"], st, str(port or ""),
+                                                             self.env_name(s), self.owner(s), detail]))
+                if s is self.llama_service():
+                    for mid, mst in self.running.items():
+                        rows.append(("model", UP if mst == "ready" else DEGRADED, "model:" + mid,
+                                     ["        " + self.model_label(mid), mst, "", "GPU", "llama-swap", ""]))
+        eph = self.port_keys(True)
+        rows.append(("group", None, "", ["Ephemeral", f"{len(eph)} new since start", "", "", "", ""]))
+        for p in eph:
+            o = self.port_owner(p)
+            rows.append(("port", EPHEMERAL, f"port:{p}", ["    " + o, "new", str(p), self.bind_text(p), o,
+                                                          "since " + self.seen_text(p)]))
+        other = self.port_keys(False)
+        rows.append(("group", None, "", ["Other listeners", f"{len(other)} unlisted", "", "", "", ""]))
+        for p in other:
+            o = self.port_owner(p)
+            rows.append(("port", IDLE, f"port:{p}", ["    " + o, "listening", str(p), self.bind_text(p), o,
+                                                     "already up at start"]))
+        res = [s for s in self.services if self.is_reserved(s)]
+        if res:
+            worst, ok, total = self.rollup(res)
+            rows.append(("group", worst, "", ["Reserved ports", f"{ok}/{total} ok", "", "", "", ""]))
+            for s in res:
+                st, detail = self.status(s)
+                rows.append(("service", st, self.key_of(s), ["    " + s["name"], st, str(s.get("port", "")),
+                                                             self.env_name(s), self.owner(s), detail]))
+        if self.port_check_time:
+            rows.append(("group", None, "", ["Port check", f"{len(self.port_verdict)} of {self.port_check_count}"
+                                             " unbindable", "", "", "", "at " + self.port_check_time.strftime("%H:%M")]))
+            for p, v in sorted(self.port_verdict.items()):
+                rows.append(("check", DOWN, "", [f"    :{p}", "unbindable", str(p), "local", "", v]))
+        return rows
+
+    def bind_text(self, port):
+        addrs = self.ports.get(port, {}).get("addrs", [])
+        return ", ".join(addrs) if addrs else "local"
+
+
+class DetailsWindow(Gtk.Window):
+    COLS = ("Name", "Status", "Port", "Where", "Owner", "Detail")
+
+    def __init__(self, app):
+        super().__init__(title=f"{APP} - Details")
+        self.app = app
+        self.set_default_size(980, 640)
+        self.connect("destroy", self.on_destroy)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=8)
+        self.summary = Gtk.Label(xalign=0, selectable=True)
+        self.summary.set_line_wrap(True)
+        box.pack_start(self.summary, False, False, 0)
+        # dot, 6 cells, key, weight
+        self.store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, str, str, str, str, str, int)
+        self.view = Gtk.TreeView(model=self.store)
+        self.view.set_enable_search(True)
+        self.view.set_search_column(1)
+        col = Gtk.TreeViewColumn(self.COLS[0])
+        pr = Gtk.CellRendererPixbuf()
+        col.pack_start(pr, False)
+        col.add_attribute(pr, "pixbuf", 0)
+        tr = Gtk.CellRendererText()
+        col.pack_start(tr, True)
+        col.add_attribute(tr, "text", 1)
+        col.add_attribute(tr, "weight", 8)
+        col.set_resizable(True)
+        self.view.append_column(col)
+        for i, name in enumerate(self.COLS[1:], start=2):
+            r = Gtk.CellRendererText()
+            c = Gtk.TreeViewColumn(name, r, text=i, weight=8)
+            c.set_resizable(True)
+            self.view.append_column(c)
+        self.view.connect("row-activated", self.on_activate)
+        self.view.connect("button-press-event", self.on_press)
+        sw = Gtk.ScrolledWindow()
+        sw.add(self.view)
+        box.pack_start(sw, True, True, 0)
+        self.add(box)
+        self.show_all()
+
+    def reload(self):
+        rows = self.app.detail_rows()
+        scroll = self.view.get_parent().get_vadjustment().get_value()
+        self.store.clear()
+        for kind, st, key, cells in rows:
+            dot = self.app.dot(st, kind == "group") if st is not None else None
+            self.store.append([dot] + cells + [key, 700 if kind == "group" else 400])
+        GLib.idle_add(lambda: self.view.get_parent().get_vadjustment().set_value(scroll) and False)
+
+    def set_summary(self, text):
+        self.summary.set_text(text)
+
+    def on_activate(self, view, path, column):
+        key = self.store[path][7]
+        if key.startswith("svc:"):
+            s = self.app.service_by_key(key)
+            if s and s.get("open"):
+                self.app.do_action("open:" + s["open"])
+        elif key.startswith("port:"):
+            self.app.do_action(f"open:http://localhost:{key[5:]}/")
+
+    def on_press(self, view, event):
+        if event.button != 3:
+            return False
+        hit = view.get_path_at_pos(int(event.x), int(event.y))
+        if not hit:
+            return False
+        key = self.store[hit[0]][7]
+        if not key:
+            return True
+        self.menu = new_menu()
+        self.app.fill_actions(key, self.menu)
+        self.menu.show_all()
+        self.menu.popup_at_pointer(event)
+        return True
+
+    def on_destroy(self, *_):
+        self.app.details = None
+
+
+class PrefsWindow(Gtk.Window):
+    SORTS = (("environment", "Environment (this machine, then servers)"), ("category", "Category"),
+             ("port", "Port"), ("name", "Name"))
+
+    def __init__(self, app):
+        super().__init__(title=f"{APP} - Preferences")
+        self.app = app
+        self.set_resizable(False)
+        self.connect("destroy", lambda *_: setattr(app, "prefs", None))
+        g = Gtk.Grid(row_spacing=8, column_spacing=12, border_width=14)
+        g.attach(Gtk.Label(label="Sort by", xalign=0), 0, 0, 1, 1)
+        self.sort = Gtk.ComboBoxText()
+        for k, label in self.SORTS:
+            self.sort.append(k, label)
+        self.sort.set_active_id(app.sort_by)
+        g.attach(self.sort, 1, 0, 2, 1)
+        self.cats = Gtk.CheckButton(label="Show categories as sub-labels", active=app.show_categories)
+        self.fold = Gtk.CheckButton(label="Fold fully healthy sections", active=app.collapse_healthy)
+        self.idle = Gtk.CheckButton(label="Hide idle optional services", active=app.hide_idle)
+        for i, w in enumerate((self.cats, self.fold, self.idle), start=1):
+            g.attach(w, 0, i, 3, 1)
+        g.attach(Gtk.Label(label="Only ports", xalign=0), 0, 4, 1, 1)
+        self.pfrom = Gtk.SpinButton.new_with_range(0, 65535, 1)
+        self.pto = Gtk.SpinButton.new_with_range(0, 65535, 1)
+        self.pfrom.set_value(app.port_from)
+        self.pto.set_value(app.port_to)
+        g.attach(self.pfrom, 1, 4, 1, 1)
+        g.attach(self.pto, 2, 4, 1, 1)
+        g.attach(Gtk.Label(label="0 = no limit", xalign=0, sensitive=False), 1, 5, 2, 1)
+        for w, sig in ((self.sort, "changed"), (self.cats, "toggled"), (self.fold, "toggled"),
+                       (self.idle, "toggled"), (self.pfrom, "value-changed"), (self.pto, "value-changed")):
+            w.connect(sig, self.changed)
+        self.add(g)
+        self.show_all()
+
+    def changed(self, *_):
+        self.app.apply_settings({"sortBy": self.sort.get_active_id(), "showCategories": self.cats.get_active(),
+                                 "collapseHealthy": self.fold.get_active(), "hideIdle": self.idle.get_active(),
+                                 "portFrom": self.pfrom.get_value_as_int(), "portTo": self.pto.get_value_as_int()})
+
+
+def new_menu():
+    """No reserved check-mark column: the status dot sits at the edge (Windows kept a gutter)."""
+    m = Gtk.Menu()
+    m.set_reserve_toggle_size(False)
+    m.get_style_context().add_class("service-tray")
+    return m
+
+
+def message(text):
+    d = Gtk.MessageDialog(message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text=APP)
+    d.format_secondary_text(text)
+    d.set_keep_above(True)
+    d.run()
+    d.destroy()
+
+
+def notify(title, body):
+    if shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "-a", APP, title, body], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+
+def parse_args(argv):
+    args, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a == "--quit-after":
+            args["quit-after"] = argv[i + 1]
+            i += 1
+        elif a.startswith("--"):
+            args[a[2:]] = True
+        else:
+            sys.exit(f"service-tray: unknown argument {a}")
+        i += 1
+    return args
+
+
+def main():
+    args = parse_args(sys.argv[1:])
+    lock_dir = os.environ.get("XDG_RUNTIME_DIR") or CONF_DIR
+    os.makedirs(lock_dir, exist_ok=True)
+    lock = open(os.path.join(lock_dir, "service-tray.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("service-tray: already running")
+    GLib.set_prgname("service-tray")
+    GLib.set_application_name(APP)
+    # Theme menu rows are ~30 px; 35 rows would not fit a 1080 p screen.
+    css = Gtk.CssProvider()
+    css.load_from_data(b"menu.service-tray menuitem { padding: 1px 5px 1px 4px; min-height: 0; }"
+                       b" menu.service-tray menuitem.sub { padding: 0 5px 0 4px; border-top-width: 0; border-bottom-width: 0; }"
+                       b" menu.service-tray separator { margin-top: 2px; margin-bottom: 2px; }")
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    Tray(args)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
